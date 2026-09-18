@@ -4,8 +4,8 @@ import pytest
 
 from app.links import extract_tme_links, find_start_links, join_target, parse_start_link
 from app.responses import is_transient_response
-from app.settings import parse_retry_delay
-from app.progress import ProgressReporter
+from app.settings import parse_requester_ids, parse_retry_delay
+from app.progress import MirroredProgressReporter, ProgressReporter
 
 
 class FakeMessage:
@@ -57,12 +57,19 @@ def test_parses_a_bounded_retry_delay() -> None:
         parse_retry_delay("61")
 
 
+def test_parses_numeric_requester_allow_list() -> None:
+    assert parse_requester_ids("123, 456") == {123, 456}
+    assert parse_requester_ids(None) == set()
+    with pytest.raises(ValueError):
+        parse_requester_ids("not-an-id")
+
+
 def test_progress_reporter_edits_one_message_with_numbered_events() -> None:
     class FakeStatusMessage:
         def __init__(self) -> None:
             self.body = ""
 
-        async def edit(self, body: str) -> None:
+        async def edit(self, body: str, **_: object) -> None:
             self.body = body
 
     message = FakeStatusMessage()
@@ -70,4 +77,21 @@ def test_progress_reporter_edits_one_message_with_numbered_events() -> None:
     asyncio.run(reporter.report("Started"))
     asyncio.run(reporter.report("Joining channel"))
 
-    assert message.body == "1. Started\n2. Joining channel"
+    assert "<b>1.</b> Started" in message.body
+    assert "<b>2.</b> Joining channel" in message.body
+
+
+def test_mirrored_progress_updates_all_recipients() -> None:
+    class FakeStatusMessage:
+        def __init__(self) -> None:
+            self.body = ""
+
+        async def edit(self, body: str, **_: object) -> None:
+            self.body = body
+
+    first = FakeStatusMessage()
+    second = FakeStatusMessage()
+    reporter = MirroredProgressReporter((ProgressReporter(first), ProgressReporter(second)))
+    asyncio.run(reporter.report("Started"))
+
+    assert first.body == second.body

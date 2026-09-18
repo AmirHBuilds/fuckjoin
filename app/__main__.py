@@ -16,14 +16,16 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 from .links import StartLink, extract_tme_links, find_start_links, join_target, parse_start_link
-from .progress import ProgressReporter
+from .progress import MirroredProgressReporter, ProgressReporter, ProgressSink
 from .responses import is_transient_response
-from .settings import parse_retry_delay
+from .settings import parse_requester_ids, parse_retry_delay
 
 RESPONSE_TIMEOUT_SECONDS = 30
 MAX_START_ATTEMPTS = 5
 MAX_BOT_HANDOFFS = 5
 MAX_TRANSIENT_RESPONSES = 10
+FOLLOWUP_WINDOW_SECONDS = 2
+MAX_QUEUE_SIZE = 100
 
 
 @dataclass
@@ -31,7 +33,14 @@ class DeliveryTask:
     """One Saved Messages request waiting for the single delivery worker."""
 
     command: str
-    progress: ProgressReporter
+    progress: ProgressSink
+
+
+def channel_link(url: str) -> str:
+    """Make a safe, compact clickable channel label for the progress message."""
+    from html import escape
+
+    return f'<a href="{escape(url, quote=True)}">🔗 Open channel</a>'
 
 
 def load_env(path: str = ".env") -> None:
@@ -47,7 +56,7 @@ def load_env(path: str = ".env") -> None:
 
 
 async def join_urls(
-    client: TelegramClient, urls: set[str], progress: ProgressReporter
+    client: TelegramClient, urls: set[str], progress: ProgressSink
 ) -> tuple[int, list[str]]:
     """Join supported URLs, returning resolved count and failures for useful status logs."""
     resolved = 0
@@ -64,22 +73,24 @@ async def join_urls(
             continue
         kind, value = target
         try:
-            await progress.report(f"Joining channel: {url}")
+            await progress.report(f"🚪 Joining {channel_link(url)}", is_html=True)
             if kind == "invite":
                 await client(ImportChatInviteRequest(value))
             else:
                 channel = await client.get_input_entity(value)
                 await client(JoinChannelRequest(channel))
             resolved += 1
-            await progress.report(f"Channel resolved: {url}")
+            await progress.report(f"✅ Joined {channel_link(url)}", is_html=True)
         except UserAlreadyParticipantError:
             # The requirement is already satisfied; retrying /start can progress the flow.
             resolved += 1
-            await progress.report(f"Already in channel: {url}")
+            await progress.report(f"✅ Already in {channel_link(url)}", is_html=True)
         except (RPCError, TypeError) as error:
             logging.info("Could not join %s: %s", url, error.__class__.__name__)
             failures.append(f"{url} ({error.__class__.__name__})")
-            await progress.report(f"Could not join {url}: {error.__class__.__name__}")
+            await progress.report(
+                f"⚠️ Could not join {channel_link(url)}: {error.__class__.__name__}", is_html=True
+            )
     return resolved, failures
 
 
@@ -103,16 +114,30 @@ async def get_actionable_response(conversation: object) -> object:
     raise TimeoutError("Bot kept sending transient wait indicators")
 
 
+async def collect_followups(conversation: object, first_response: object) -> list[object]:
+    """Collect additional bot messages that arrive shortly after the first response."""
+    messages = [first_response]
+    while True:
+        try:
+            message = await asyncio.wait_for(
+                conversation.get_response(), timeout=FOLLOWUP_WINDOW_SECONDS
+            )
+        except TimeoutError:
+            return messages
+        if not is_transient_response(message):
+            messages.append(message)
+
+
 async def run_bot_flow(
-    client: TelegramClient, start: StartLink, retry_delay_seconds: float, progress: ProgressReporter
+    client: TelegramClient, start: StartLink, retry_delay_seconds: float, progress: ProgressSink
 ) -> tuple[object, int, list[str]]:
     """Run one bot's start/join/retry sequence and return its last response."""
     bot = await client.get_entity(start.bot)
     async with client.conversation(bot, timeout=RESPONSE_TIMEOUT_SECONDS) as conversation:
-        await progress.report(f"Sending /start to @{start.bot}")
+        await progress.report(f"📤 Sending /start to @{start.bot}")
         await conversation.send_message(f"/start {start.argument}")
         response = await get_actionable_response(conversation)
-        await progress.report(f"Received response from @{start.bot}")
+        await progress.report(f"📥 Received response from @{start.bot}")
         joined_total = 0
         failures: list[str] = []
         seen_links: set[str] = set()
@@ -126,7 +151,7 @@ async def run_bot_flow(
                 and not any(link.bot for link in find_start_links({url}))
             )
             if channel_count:
-                await progress.report(f"Bot lists {channel_count} channel requirement(s)")
+                await progress.report(f"📋 Bot lists {channel_count} channel requirement(s)")
             resolved, join_failures = await join_urls(client, links, progress)
             joined_total += resolved
             failures.extend(join_failures)
@@ -134,14 +159,15 @@ async def run_bot_flow(
             if not resolved:
                 break
             if retry_delay_seconds:
-                await progress.report(f"Waiting {retry_delay_seconds:g} second(s) before retry")
+                await progress.report(f"⏱️ Waiting {retry_delay_seconds:g} second(s) before retry")
                 await asyncio.sleep(retry_delay_seconds)
-            await progress.report(f"Re-sending /start to @{start.bot}")
+            await progress.report(f"🔁 Re-sending /start to @{start.bot}")
             await conversation.send_message(f"/start {start.argument}")
             response = await get_actionable_response(conversation)
-            await progress.report(f"Received updated response from @{start.bot}")
+            await progress.report(f"📥 Received updated response from @{start.bot}")
 
-    return response, joined_total, failures
+        messages = await collect_followups(conversation, response)
+    return messages, joined_total, failures
 
 
 async def deliver(
@@ -149,7 +175,7 @@ async def deliver(
     command: str,
     allowed_bots: set[str],
     retry_delay_seconds: float,
-    progress: ProgressReporter,
+    progress: ProgressSink,
 ) -> str:
     """Run permitted bot flows, following explicitly allowed bot deep-link handoffs."""
     try:
@@ -165,7 +191,7 @@ async def deliver(
     failures: list[str] = []
     handoffs = 0
     for _ in range(MAX_BOT_HANDOFFS):
-        response, joined, join_failures = await run_bot_flow(
+        responses, joined, join_failures = await run_bot_flow(
             client, current, retry_delay_seconds, progress
         )
         joined_total += joined
@@ -173,7 +199,9 @@ async def deliver(
         next_start = next(
             (
                 link
-                for link in find_start_links(response_links(response))
+                for link in find_start_links(
+                    set().union(*(response_links(response) for response in responses))
+                )
                 if link.bot in allowed_bots and (link.bot, link.argument) not in seen
             ),
             None,
@@ -183,18 +211,25 @@ async def deliver(
         current = next_start
         seen.add((current.bot, current.argument))
         handoffs += 1
-        await progress.report(f"Following handoff to @{current.bot}")
+        await progress.report(f"➡️ Following handoff to @{current.bot}")
 
     failure_note = f" Could not join: {'; '.join(failures)}." if failures else ""
-    if getattr(response, "noforwards", False):
-        return f"Cannot deliver: @{current.bot} has forwarding/copying protection enabled.{failure_note}"
-    try:
-        await progress.report("Sending final content to Saved Messages")
-        await client.forward_messages("me", response)
-    except ChatForwardsRestrictedError:
+    sent = 0
+    await progress.report(f"📦 Fetching {len(responses)} final message(s)")
+    for response in responses:
+        if getattr(response, "noforwards", False):
+            await progress.report("⚠️ Skipped protected message")
+            continue
+        try:
+            await progress.report("📨 Sending content to Saved Messages")
+            await client.forward_messages("me", response)
+            sent += 1
+        except ChatForwardsRestrictedError:
+            await progress.report("⚠️ Skipped protected message")
+    if not sent:
         return f"Cannot deliver: @{current.bot} has forwarding/copying protection enabled.{failure_note}"
 
-    status = f"Done: forwarded response from @{current.bot} ({joined_total} channel(s) resolved, {handoffs} handoff(s))."
+    status = f"✅ Done: forwarded {sent} message(s) from @{current.bot} ({joined_total} channel(s) resolved, {handoffs} handoff(s))."
     return status + failure_note
 
 
@@ -208,19 +243,19 @@ async def process_tasks(
     while True:
         task = await queue.get()
         try:
-            await task.progress.report("Started")
+            await task.progress.report("🚀 Started")
             status = await deliver(
                 client, task.command, allowed_bots, retry_delay_seconds, task.progress
             )
             await task.progress.report(status)
         except TimeoutError:
-            await task.progress.report("Failed: timed out waiting for the bot response")
+            await task.progress.report("Timed out waiting for the bot response", failed=True)
         except (RPCError, TypeError) as error:
             logging.exception("Telegram error while handling /get")
-            await task.progress.report(f"Failed: {error.__class__.__name__}")
+            await task.progress.report(f"{error.__class__.__name__}", failed=True)
         except Exception as error:
             logging.exception("Unexpected error while handling /get")
-            await task.progress.report(f"Failed: {error.__class__.__name__}: {error}")
+            await task.progress.report(f"{error.__class__.__name__}: {error}", failed=True)
         finally:
             queue.task_done()
 
@@ -230,18 +265,39 @@ async def main() -> None:
     api_id = int(os.environ["API_ID"])
     api_hash = os.environ["API_HASH"]
     retry_delay_seconds = parse_retry_delay(os.environ.get("RETRY_DELAY_SECONDS"))
+    allowed_requester_ids = parse_requester_ids(os.environ.get("ALLOWED_REQUESTER_IDS"))
     allowed_bots = {item.strip().lstrip("@").lower() for item in os.environ["ALLOWED_BOTS"].split(",") if item.strip()}
     if not allowed_bots:
         raise ValueError("ALLOWED_BOTS must contain at least one approved bot username")
     client = TelegramClient(os.environ.get("SESSION_NAME", "telegram-automation"), api_id, api_hash)
-    queue: asyncio.Queue[DeliveryTask] = asyncio.Queue()
+    queue: asyncio.Queue[DeliveryTask] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 
-    @client.on(events.NewMessage(chats="me", outgoing=True, pattern=r"^/get\s+"))
+    @client.on(events.NewMessage(pattern=r"^/get\s+"))
     async def handle_get(event: events.NewMessage.Event) -> None:
-        message = await event.reply("Queued: waiting to start...")
-        await queue.put(
-            DeliveryTask(event.raw_text.removeprefix("/get ").strip(), ProgressReporter(message))
-        )
+        me = await client.get_me()
+        if event.out:
+            if event.chat_id != me.id:
+                return
+            message = await event.reply(
+                "⏳ <b>Delivery queued</b>\n<i>Waiting to start…</i>", parse_mode="html"
+            )
+            progress: ProgressSink = ProgressReporter(message)
+        elif event.is_private and event.sender_id in allowed_requester_ids:
+            requester_message = await event.reply(
+                "⏳ <b>Delivery queued</b>\n<i>Waiting to start…</i>", parse_mode="html"
+            )
+            owner_message = await client.send_message(
+                "me", f"⏳ Remote request queued from user ID {event.sender_id}"
+            )
+            progress = MirroredProgressReporter(
+                (ProgressReporter(requester_message), ProgressReporter(owner_message))
+            )
+        else:
+            return
+        try:
+            queue.put_nowait(DeliveryTask(event.raw_text.removeprefix("/get ").strip(), progress))
+        except asyncio.QueueFull:
+            await progress.report("Queue is full; please try again later", failed=True)
 
     await client.start()
     worker = asyncio.create_task(process_tasks(queue, client, allowed_bots, retry_delay_seconds))

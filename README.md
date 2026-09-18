@@ -19,7 +19,17 @@ The tool then:
 5. follows a new, allow-listed bot `?start=` link if the bot hands off delivery; and
 6. forwards the resulting response to Saved Messages.
 
-It creates one status message in Saved Messages and edits it as the job progresses: start sent, detected channels, each join attempt, retries, handoffs, forwarding, or a final failure. Requests are processed through a single task queue, so multiple `/get` commands do not overlap.
+It creates one formatted status message in Saved Messages and edits it as the job progresses: start sent, detected channels, clickable channel links, each join attempt, retries, handoffs, every final message, forwarding, or a final failure. Requests are processed through a single task queue, so multiple `/get` commands do not overlap. A bot may send several final messages; the tool collects messages that arrive within two seconds of its final response and forwards every forwardable one.
+
+## Let approved friends submit requests
+
+By default, only your own Saved Messages `/get` commands are accepted. To allow a friend, add their **numeric Telegram user ID** to `ALLOWED_REQUESTER_IDS` in `.env` and restart the tool:
+
+```env
+ALLOWED_REQUESTER_IDS=123456789,987654321
+```
+
+They must send `/get <link>` in a private chat with your account. The final forwarded messages and the same editable progress report are sent to them; an identical progress report is mirrored to your Saved Messages. Never use usernames for this allow-list and do not leave it open to everyone.
 
 It ignores a bare `⏳` or `⌛` wait message and waits for the bot's next response. It also repeats the check after each successful join (up to five passes), so it can handle bots that reveal channel requirements in stages. Before each retry it waits `RETRY_DELAY_SECONDS` (2 seconds by default); set it to `0`–`60` in `.env` if a particular approved bot needs a different delay. It can follow up to five handoffs to another bot, but **every** handoff bot must be in `ALLOWED_BOTS`. This prevents an accidental `/get` command from driving an unapproved bot. Do not add a bot unless its operator has given permission.
 
