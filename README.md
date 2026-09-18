@@ -18,7 +18,7 @@ The tool then:
 4. sends the same `/start` command again; and
 5. forwards the resulting response to Saved Messages.
 
-It only accepts bots listed in `ALLOWED_BOTS`. This prevents an accidental `/get` command from driving an unapproved bot. Do not add a bot unless its operator has given permission.
+It ignores a bare `⏳` or `⌛` wait message and waits for the bot's next response. It also repeats the check after each successful join (up to five passes), so it can handle bots that reveal channel requirements in stages. It only accepts bots listed in `ALLOWED_BOTS`. This prevents an accidental `/get` command from driving an unapproved bot. Do not add a bot unless its operator has given permission.
 
 ## Setup
 
@@ -58,3 +58,5 @@ The join step supports public `https://t.me/channel_name` links and private `htt
 ## Limits
 
 This is a small workflow helper, not a universal bot scraper. It processes one `/get` request at a time and waits up to 30 seconds for each bot response. It does not solve CAPTCHAs, approval requests, payment gates, or custom interactive challenges.
+
+If the final bot response has Telegram's protected-content/forwarding restriction enabled, Telegram will not let any client forward or copy it. The tool reports this in Saved Messages instead of crashing; it cannot bypass that Telegram restriction.

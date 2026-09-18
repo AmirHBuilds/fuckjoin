@@ -1,6 +1,14 @@
 import pytest
 
 from app.links import extract_tme_links, join_target, parse_start_link
+from app.responses import is_transient_response
+
+
+class FakeMessage:
+    def __init__(self, text: str, media: object | None = None, buttons: object | None = None) -> None:
+        self.raw_text = text
+        self.media = media
+        self.buttons = buttons
 
 
 def test_parses_bot_start_link() -> None:
@@ -21,3 +29,9 @@ def test_finds_and_classifies_public_and_invite_links() -> None:
     assert join_target("https://t.me/channel_one") == ("public", "channel_one")
     assert join_target("https://t.me/+InviteHash") == ("invite", "InviteHash")
     assert len(links) == 2
+
+
+def test_only_bare_wait_indicator_is_transient() -> None:
+    assert is_transient_response(FakeMessage("⏳"))
+    assert not is_transient_response(FakeMessage("⏳", media=object()))
+    assert not is_transient_response(FakeMessage("⏳", buttons=[[object()]]))
