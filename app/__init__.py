@@ -1,0 +1,1 @@
+"""Authorized Telegram delivery automation."""
