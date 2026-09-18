@@ -11,7 +11,11 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
-from telethon.errors.rpcerrorlist import ChatForwardsRestrictedError, UserAlreadyParticipantError
+from telethon.errors.rpcerrorlist import (
+    ChatForwardsRestrictedError,
+    FloodWaitError,
+    UserAlreadyParticipantError,
+)
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
@@ -34,6 +38,7 @@ class DeliveryTask:
 
     command: str
     progress: ProgressSink
+    recipient: str | int
 
 
 def channel_link(url: str) -> str:
@@ -72,25 +77,40 @@ async def join_urls(
         if target is None:
             continue
         kind, value = target
-        try:
-            await progress.report(f"🚪 Joining {channel_link(url)}", is_html=True)
-            if kind == "invite":
-                await client(ImportChatInviteRequest(value))
-            else:
-                channel = await client.get_input_entity(value)
-                await client(JoinChannelRequest(channel))
-            resolved += 1
-            await progress.report(f"✅ Joined {channel_link(url)}", is_html=True)
-        except UserAlreadyParticipantError:
-            # The requirement is already satisfied; retrying /start can progress the flow.
-            resolved += 1
-            await progress.report(f"✅ Already in {channel_link(url)}", is_html=True)
-        except (RPCError, TypeError) as error:
-            logging.info("Could not join %s: %s", url, error.__class__.__name__)
-            failures.append(f"{url} ({error.__class__.__name__})")
-            await progress.report(
-                f"⚠️ Could not join {channel_link(url)}: {error.__class__.__name__}", is_html=True
-            )
+        for attempt in range(2):
+            try:
+                await progress.report(f"🚪 Joining {channel_link(url)}", is_html=True)
+                if kind == "invite":
+                    await client(ImportChatInviteRequest(value))
+                else:
+                    channel = await client.get_input_entity(value)
+                    await client(JoinChannelRequest(channel))
+                resolved += 1
+                await progress.report(f"✅ Joined {channel_link(url)}", is_html=True)
+                break
+            except UserAlreadyParticipantError:
+                # The requirement is already satisfied; retrying /start can progress the flow.
+                resolved += 1
+                await progress.report(f"✅ Already in {channel_link(url)}", is_html=True)
+                break
+            except FloodWaitError as error:
+                if attempt == 1:
+                    failures.append(f"{url} (FloodWaitError after retry)")
+                    await progress.report(f"⚠️ Could not join {channel_link(url)}", is_html=True)
+                    break
+                await progress.report(
+                    f"⏳ Telegram rate limit: waiting {error.seconds}s before retrying "
+                    f"{channel_link(url)}",
+                    is_html=True,
+                )
+                await asyncio.sleep(error.seconds)
+            except (RPCError, TypeError) as error:
+                logging.info("Could not join %s: %s", url, error.__class__.__name__)
+                failures.append(f"{url} ({error.__class__.__name__})")
+                await progress.report(
+                    f"⚠️ Could not join {channel_link(url)}: {error.__class__.__name__}", is_html=True
+                )
+                break
     return resolved, failures
 
 
@@ -176,6 +196,7 @@ async def deliver(
     allowed_bots: set[str],
     retry_delay_seconds: float,
     progress: ProgressSink,
+    recipient: str | int,
 ) -> str:
     """Run permitted bot flows, following explicitly allowed bot deep-link handoffs."""
     try:
@@ -221,8 +242,8 @@ async def deliver(
             await progress.report("⚠️ Skipped protected message")
             continue
         try:
-            await progress.report("📨 Sending content to Saved Messages")
-            await client.forward_messages("me", response)
+            await progress.report("📨 Sending content to requester")
+            await client.forward_messages(recipient, response)
             sent += 1
         except ChatForwardsRestrictedError:
             await progress.report("⚠️ Skipped protected message")
@@ -245,7 +266,12 @@ async def process_tasks(
         try:
             await task.progress.report("🚀 Started")
             status = await deliver(
-                client, task.command, allowed_bots, retry_delay_seconds, task.progress
+                client,
+                task.command,
+                allowed_bots,
+                retry_delay_seconds,
+                task.progress,
+                task.recipient,
             )
             await task.progress.report(status)
         except TimeoutError:
@@ -282,6 +308,7 @@ async def main() -> None:
                 "⏳ <b>Delivery queued</b>\n<i>Waiting to start…</i>", parse_mode="html"
             )
             progress: ProgressSink = ProgressReporter(message)
+            recipient: str | int = "me"
         elif event.is_private and event.sender_id in allowed_requester_ids:
             requester_message = await event.reply(
                 "⏳ <b>Delivery queued</b>\n<i>Waiting to start…</i>", parse_mode="html"
@@ -292,10 +319,11 @@ async def main() -> None:
             progress = MirroredProgressReporter(
                 (ProgressReporter(requester_message), ProgressReporter(owner_message))
             )
+            recipient = event.sender_id
         else:
             return
         try:
-            queue.put_nowait(DeliveryTask(event.raw_text.removeprefix("/get ").strip(), progress))
+            queue.put_nowait(DeliveryTask(event.raw_text.removeprefix("/get ").strip(), progress, recipient))
         except asyncio.QueueFull:
             await progress.report("Queue is full; please try again later", failed=True)
 
