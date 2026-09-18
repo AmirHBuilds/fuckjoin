@@ -28,6 +28,17 @@ def parse_start_link(value: str) -> StartLink:
     return StartLink(bot=match.group(1).lower(), argument=argument)
 
 
+def find_start_links(urls: set[str]) -> list[StartLink]:
+    """Return valid bot deep links from an arbitrary collection of Telegram URLs."""
+    start_links: list[StartLink] = []
+    for url in urls:
+        try:
+            start_links.append(parse_start_link(url))
+        except ValueError:
+            continue
+    return start_links
+
+
 def extract_tme_links(text: str) -> set[str]:
     """Return normalized Telegram URLs found in a text response."""
     return {unquote(match.group(0).rstrip(".,!?")) for match in TME_LINK_RE.finditer(text)}

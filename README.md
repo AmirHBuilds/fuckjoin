@@ -15,10 +15,13 @@ The tool then:
 1. sends `/start 9ym1SMzU` to the authorized bot;
 2. reads join-channel URLs from that bot's inline keyboard and message text;
 3. joins those channels with **your account**;
-4. sends the same `/start` command again; and
-5. forwards the resulting response to Saved Messages.
+4. sends the same `/start` command again;
+5. follows a new, allow-listed bot `?start=` link if the bot hands off delivery; and
+6. forwards the resulting response to Saved Messages.
 
-It ignores a bare `⏳` or `⌛` wait message and waits for the bot's next response. It also repeats the check after each successful join (up to five passes), so it can handle bots that reveal channel requirements in stages. It only accepts bots listed in `ALLOWED_BOTS`. This prevents an accidental `/get` command from driving an unapproved bot. Do not add a bot unless its operator has given permission.
+It creates one status message in Saved Messages and edits it as the job progresses: start sent, detected channels, each join attempt, retries, handoffs, forwarding, or a final failure. Requests are processed through a single task queue, so multiple `/get` commands do not overlap.
+
+It ignores a bare `⏳` or `⌛` wait message and waits for the bot's next response. It also repeats the check after each successful join (up to five passes), so it can handle bots that reveal channel requirements in stages. Before each retry it waits `RETRY_DELAY_SECONDS` (2 seconds by default); set it to `0`–`60` in `.env` if a particular approved bot needs a different delay. It can follow up to five handoffs to another bot, but **every** handoff bot must be in `ALLOWED_BOTS`. This prevents an accidental `/get` command from driving an unapproved bot. Do not add a bot unless its operator has given permission.
 
 ## Setup
 
