@@ -1,6 +1,6 @@
 """Helpers for deciding whether a bot message is ready to process."""
 
-TRANSIENT_TEXTS = {"⏳", "⌛"}
+TRANSIENT_TEXTS = {"...", "Please wait", "Processing...", "⏳", "⌛"}
 
 
 def is_transient_response(message: object) -> bool:

@@ -22,7 +22,7 @@ class ProgressReporter:
 
     async def report(self, event: str, *, is_html: bool = False, failed: bool = False) -> None:
         self.events.append((event, is_html))
-        title = "❌ <b>Delivery failed</b>" if failed else "⏳ <b>Delivery in progress</b>"
+        title = "[✗] <b>Delivery failed</b>" if failed else "[-] <b>Delivery in progress</b>"
         rows = "\n".join(
             f"<b>{index}.</b> {item if item_is_html else escape(item)}"
             for index, (item, item_is_html) in enumerate(self.events, start=1)
