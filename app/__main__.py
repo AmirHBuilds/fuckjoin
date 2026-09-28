@@ -74,34 +74,49 @@ async def safe_forward_messages(
     client: TelegramClient,
     recipient: str | int,
     messages: list[object],
+    progress: ProgressReporter | None = None,
     chunk_size: int = 5,
     delay_between_chunks: float = 1.5,
 ) -> int:
-    """Forward messages in safe chunk sizes with automatic FloodWait handling."""
+    """Forward messages in safe chunk sizes with visible FloodWait handling."""
     sent = 0
-    for i in range(0, len(messages), chunk_size):
-        chunk = messages[i : i + chunk_size]
+    valid_messages = [
+        msg for msg in messages 
+        if msg and (getattr(msg, "media", None) or getattr(msg, "raw_text", "").strip())
+    ]
+    if not valid_messages:
+        return 0
+
+    for i in range(0, len(valid_messages), chunk_size):
+        chunk = valid_messages[i : i + chunk_size]
         for attempt in range(3):
             try:
-                await client.forward_messages(recipient, chunk)
-                sent += len(chunk)
-                if i + chunk_size < len(messages):
+                res = await client.forward_messages(recipient, chunk)
+                if isinstance(res, list):
+                    sent += len(res)
+                elif res:
+                    sent += len(chunk)
+                if i + chunk_size < len(valid_messages):
                     await asyncio.sleep(delay_between_chunks)
                 break
             except FloodWaitError as err:
-                if err.seconds > 180:
-                    logging.warning("FloodWait on forward too long (%ds). Skipping chunk.", err.seconds)
-                    break
-                logging.info("Sleeping %ds for ForwardMessages flood wait", err.seconds)
+                msg = f"[ⴵ] Rate limit: waiting {err.seconds}s before retrying forward..."
+                print(f"\n{msg}", flush=True)
+                logging.warning(msg)
+                if progress:
+                    await progress.report(msg)
+
                 await asyncio.sleep(err.seconds + 1)
+
+                if progress:
+                    await progress.report("[➴] Resuming content delivery...")
             except ChatForwardsRestrictedError:
-                logging.warning("Chat has restricted forwarding; could not forward chunk.")
+                logging.warning("Chat has restricted forwarding; skipped chunk.")
                 break
             except RPCError as err:
                 logging.warning("RPC error forwarding chunk: %s", err)
                 break
     return sent
-
 
 async def join_urls(
     client: TelegramClient,
@@ -270,7 +285,7 @@ async def deliver(
     transient_texts: list[str],
     blocked_words: list[str],
 ) -> tuple[str, list[object]]:
-    """Run bot flow, filter blocked texts, safely forward to recipient, and return status."""
+    """Fetch to Saved Messages first (instant), then relay to user safely."""
     try:
         start = parse_start_link(command)
     except ValueError as error:
@@ -325,11 +340,27 @@ async def deliver(
         status = f"[✗] Cannot deliver: No valid content or protection enabled.{failure_note}"
         return status, []
 
-    # Single clean line reporting delivery to requester
-    await progress.report(f"[➴] Sending content to requester")
+    # STAGE 1: Instantly back up all items to Saved Messages before they auto-delete
+    try:
+        saved_backup = await client.forward_messages("me", deliverable_messages)
+        if not isinstance(saved_backup, list):
+            saved_backup = [saved_backup]
+    except Exception as e:
+        logging.error("Failed to back up to Saved Messages: %s", e)
+        saved_backup = deliverable_messages
 
-    # Safe chunked forward with automatic FloodWait recovery
-    sent_count = await safe_forward_messages(client, recipient, deliverable_messages)
+    # STAGE 2: If the recipient is not 'me', relay from Saved Messages to the requester
+    if recipient != "me":
+        await progress.report("[➴] Sending content to requester")
+        sent_count = await safe_forward_messages(
+            client=client,
+            recipient=recipient,
+            messages=saved_backup,
+            progress=progress,
+        )
+    else:
+        sent_count = len(saved_backup)
+
     if not sent_count:
         return f"[✗] Cannot deliver: Content could not be forwarded.{failure_note}", []
 
@@ -337,8 +368,7 @@ async def deliver(
         f"[✿] Done: forwarded {sent_count} message(s) from @{current.bot} "
         f"({joined_total} channel(s) resolved, {handoffs} handoff(s)).{failure_note}"
     )
-    return status, deliverable_messages[:sent_count]
-
+    return status, saved_backup[:sent_count]
 
 async def send_saved_report(
     client: TelegramClient,
@@ -346,8 +376,14 @@ async def send_saved_report(
     status: str,
     delivered_messages: list[object],
 ) -> None:
-    """Send execution report to Saved Messages ('me') and safely forward delivered files."""
+    """Send execution report summary to Saved Messages ('me')."""
     user_status_flow = task.progress.get_rendered_text()
+    
+    # Truncate process logs if they are too long for a single Telegram message
+    if len(user_status_flow) > 3000:
+        user_status_flow = user_status_flow[:3000] + "\n...[truncated]"
+
+    count = len(delivered_messages)
 
     report = (
         f"<b>[Task Report]</b>\n"
@@ -358,15 +394,25 @@ async def send_saved_report(
         f"<code>{escape(task.command)}</code>\n\n"
         f"<b>[Bot Process]</b>\n"
         f"<pre>{escape(user_status_flow)}</pre>\n\n"
-        f"<b>[Sent Content Count]</b>: {len(delivered_messages)} message(s)"
+        f"<b>[Sent Content Count]</b>: {count} message(s)"
     )
     try:
         await client.send_message("me", report, parse_mode="html")
-        if delivered_messages:
-            await safe_forward_messages(client, "me", delivered_messages)
+        print("[✓] Report sent to Saved Messages", flush=True)
     except Exception as e:
         logging.error("Failed to send task report to Saved Messages: %s", e)
-
+        # Fallback to plain text in case HTML parsing failed
+        try:
+            plain_report = (
+                f"[Task Report]\nStatus: {status}\n\n"
+                f"User: {task.sender_info}\n"
+                f"Link: {task.command}\n\n"
+                f"[Bot Process]\n{user_status_flow}\n\n"
+                f"Sent: {count} message(s)"
+            )
+            await client.send_message("me", plain_report)
+        except Exception as inner_e:
+            logging.error("Fallback report also failed: %s", inner_e)
 
 async def process_tasks(
     queue: asyncio.Queue[DeliveryTask],
@@ -418,7 +464,6 @@ async def process_tasks(
             await send_saved_report(client, task, status, delivered_messages)
             queue.task_done()
 
-
 async def enqueue_link(
     queue: asyncio.Queue[DeliveryTask],
     event: events.NewMessage.Event,
@@ -442,9 +487,18 @@ async def enqueue_link(
         )
     except asyncio.QueueFull:
         await progress.report("[✗] Queue is full; please try again later", failed=True, sent_count=0)
-
+def handle_task_exception(task: asyncio.Task) -> None:
+    """Print uncaught exceptions from background workers immediately."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logging.exception("Unhandled crash in background worker:")
 
 async def main() -> None:
+    # Suppress verbose missing-mapping warnings from Telethon internals
+    logging.getLogger("telethon").setLevel(logging.INFO)
     load_env()
     api_id = int(os.environ["API_ID"])
     api_hash = os.environ["API_HASH"]
@@ -457,7 +511,7 @@ async def main() -> None:
     transient_texts = parse_csv_list(os.environ.get("TRANSIENT_TEXTS"), default=default_transients)
     blocked_words = parse_csv_list(os.environ.get("BLOCKED_TEXT_WORDS"), default=[])
 
-    client = TelegramClient(os.environ.get("SESSION_NAME", "telegram-automation"), api_id, api_hash)
+    client = TelegramClient(os.environ.get("SESSION_NAME", "telegram-automation"), api_id, api_hash,flood_sleep_threshold=0)
     queue: asyncio.Queue[DeliveryTask] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     tracker = ChannelTracker()
 
