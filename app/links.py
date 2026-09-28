@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, unquote, urlparse
+from telethon.tl.types import MessageEntityTextUrl
 
 START_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]{5,})\?([^\s]+)", re.IGNORECASE)
 TME_LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/)?[^\s<>()]+", re.IGNORECASE)
@@ -14,6 +15,8 @@ TME_LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/)?[^\s<>()]+", re.IGNORECA
 class StartLink:
     bot: str
     argument: str
+    url: str = ""
+    label: str = ""
 
 
 def parse_start_link(value: str) -> StartLink:
@@ -25,7 +28,55 @@ def parse_start_link(value: str) -> StartLink:
     argument = query.get("start", [""])[0]
     if not argument:
         raise ValueError("The link must include a non-empty start argument")
-    return StartLink(bot=match.group(1).lower(), argument=argument)
+    return StartLink(bot=match.group(1).lower(), argument=argument, url=match.group(0))
+
+
+def extract_bot_start_links_with_labels(message: object) -> list[StartLink]:
+    """Find all valid bot start links from message text and formatted entities."""
+    raw_text = getattr(message, "raw_text", "") or ""
+    entities = getattr(message, "entities", None) or []
+    results: list[StartLink] = []
+    seen_urls: set[str] = set()
+
+    # 1. Scan formatted text URLs (e.g. hyperlinks inside words)
+    for entity in entities:
+        if isinstance(entity, MessageEntityTextUrl) and entity.url:
+            try:
+                parsed = parse_start_link(entity.url)
+                if parsed.url not in seen_urls:
+                    seen_urls.add(parsed.url)
+                    # Extract anchor label from the text slice
+                    label = raw_text[entity.offset : entity.offset + entity.length].strip()
+                    results.append(
+                        StartLink(
+                            bot=parsed.bot,
+                            argument=parsed.argument,
+                            url=parsed.url,
+                            label=label or f"@{parsed.bot}",
+                        )
+                    )
+            except ValueError:
+                pass
+
+    # 2. Scan plain text URLs
+    for match in START_LINK_RE.finditer(raw_text):
+        url = match.group(0)
+        if url not in seen_urls:
+            seen_urls.add(url)
+            try:
+                parsed = parse_start_link(url)
+                results.append(
+                    StartLink(
+                        bot=parsed.bot,
+                        argument=parsed.argument,
+                        url=parsed.url,
+                        label=f"@{parsed.bot}",
+                    )
+                )
+            except ValueError:
+                pass
+
+    return results
 
 
 def find_start_links(urls: set[str]) -> list[StartLink]:

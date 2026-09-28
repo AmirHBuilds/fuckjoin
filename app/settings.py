@@ -1,4 +1,6 @@
-"""Small configuration validators for the automation runtime."""
+"""Configuration parsers and validators for the automation runtime."""
+
+from __future__ import annotations
 
 
 def parse_retry_delay(value: str | None) -> float:
@@ -20,3 +22,18 @@ def parse_requester_ids(value: str | None) -> set[int]:
         return {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as error:
         raise ValueError("ALLOWED_REQUESTER_IDS must contain comma-separated numeric Telegram IDs") from error
+
+
+def parse_csv_list(value: str | None, default: list[str] | None = None) -> list[str]:
+    """Parse comma-separated values into a lowercase list of trimmed strings."""
+    if not value:
+        return default or []
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def parse_int_setting(value: str | None, default: int) -> int:
+    """Parse positive integer setting."""
+    try:
+        return int(value or default)
+    except ValueError:
+        return default
