@@ -1,4 +1,4 @@
-"""Editable Saved Messages progress reporting for queued delivery tasks."""
+"""Editable progress reporting for queued delivery tasks."""
 
 from __future__ import annotations
 
@@ -10,32 +10,52 @@ from typing import Protocol
 class ProgressSink(Protocol):
     """Receives delivery lifecycle events."""
 
-    async def report(self, event: str, *, is_html: bool = False, failed: bool = False) -> None: ...
+    async def report(
+        self,
+        event: str,
+        *,
+        failed: bool = False,
+        success: bool = False,
+        in_place: bool = False,
+    ) -> None: ...
+
+    def get_rendered_text(self) -> str: ...
 
 
 @dataclass
 class ProgressReporter:
-    """Append numbered events to one Telegram message instead of spamming messages."""
+    """Manage line events and update a Telegram progress message."""
 
     message: object
-    events: list[tuple[str, bool]] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
+    last_title: str = "[⏳ Delivery in progress]"
 
-    async def report(self, event: str, *, is_html: bool = False, failed: bool = False) -> None:
-        self.events.append((event, is_html))
-        title = "[✗] <b>Delivery failed</b>" if failed else "[-] <b>Delivery in progress</b>"
-        rows = "\n".join(
-            f"<b>{index}.</b> {item if item_is_html else escape(item)}"
-            for index, (item, item_is_html) in enumerate(self.events, start=1)
-        )
-        await self.message.edit(f"{title}\n<i>Live status</i>\n\n{rows}", parse_mode="html")
+    def _render(self, title: str) -> str:
+        body = escape("\n".join(self.events))
+        return f"<b>{title}</b>\n\n<pre>{body}</pre>"
 
+    async def report(
+        self,
+        event: str,
+        *,
+        failed: bool = False,
+        success: bool = False,
+        in_place: bool = False,
+    ) -> None:
+        if failed:
+            self.last_title = "[❌ Delivery failed]"
+        elif success:
+            self.last_title = "[✅ Delivery completed]"
+        else:
+            self.last_title = "[⏳ Delivery in progress]"
 
-@dataclass
-class MirroredProgressReporter:
-    """Write identical status updates to the requester and the account owner."""
+        if in_place and self.events:
+            self.events[-1] = event
+        else:
+            self.events.append(event)
 
-    reporters: tuple[ProgressSink, ...]
+        await self.message.edit(self._render(self.last_title), parse_mode="html")
 
-    async def report(self, event: str, *, is_html: bool = False, failed: bool = False) -> None:
-        for reporter in self.reporters:
-            await reporter.report(event, is_html=is_html, failed=failed)
+    def get_rendered_text(self) -> str:
+        """Return the plain-text lines of all progress steps sent to the user."""
+        return "\n".join(self.events)
