@@ -70,6 +70,39 @@ def load_env(path: str = ".env") -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
+async def safe_forward_messages(
+    client: TelegramClient,
+    recipient: str | int,
+    messages: list[object],
+    chunk_size: int = 5,
+    delay_between_chunks: float = 1.5,
+) -> int:
+    """Forward messages in safe chunk sizes with automatic FloodWait handling."""
+    sent = 0
+    for i in range(0, len(messages), chunk_size):
+        chunk = messages[i : i + chunk_size]
+        for attempt in range(3):
+            try:
+                await client.forward_messages(recipient, chunk)
+                sent += len(chunk)
+                if i + chunk_size < len(messages):
+                    await asyncio.sleep(delay_between_chunks)
+                break
+            except FloodWaitError as err:
+                if err.seconds > 180:
+                    logging.warning("FloodWait on forward too long (%ds). Skipping chunk.", err.seconds)
+                    break
+                logging.info("Sleeping %ds for ForwardMessages flood wait", err.seconds)
+                await asyncio.sleep(err.seconds + 1)
+            except ChatForwardsRestrictedError:
+                logging.warning("Chat has restricted forwarding; could not forward chunk.")
+                break
+            except RPCError as err:
+                logging.warning("RPC error forwarding chunk: %s", err)
+                break
+    return sent
+
+
 async def join_urls(
     client: TelegramClient,
     urls: set[str],
@@ -237,7 +270,7 @@ async def deliver(
     transient_texts: list[str],
     blocked_words: list[str],
 ) -> tuple[str, list[object]]:
-    """Run bot flow, filter blocked texts, batch forward to recipient, and return status."""
+    """Run bot flow, filter blocked texts, safely forward to recipient, and return status."""
     try:
         start = parse_start_link(command)
     except ValueError as error:
@@ -292,19 +325,19 @@ async def deliver(
         status = f"[✗] Cannot deliver: No valid content or protection enabled.{failure_note}"
         return status, []
 
-    # Batch forward all deliverable messages at once
-    try:
-        for _ in deliverable_messages:
-            await progress.report("[➴] Sending content to requester")
-        await client.forward_messages(recipient, deliverable_messages)
-    except ChatForwardsRestrictedError:
-        return f"[✗] Cannot deliver: Content is copy-protected.{failure_note}", []
+    # Single clean line reporting delivery to requester
+    await progress.report(f"[➴] Sending content to requester")
+
+    # Safe chunked forward with automatic FloodWait recovery
+    sent_count = await safe_forward_messages(client, recipient, deliverable_messages)
+    if not sent_count:
+        return f"[✗] Cannot deliver: Content could not be forwarded.{failure_note}", []
 
     status = (
-        f"[✿] Done: forwarded {len(deliverable_messages)} message(s) from @{current.bot} "
+        f"[✿] Done: forwarded {sent_count} message(s) from @{current.bot} "
         f"({joined_total} channel(s) resolved, {handoffs} handoff(s)).{failure_note}"
     )
-    return status, deliverable_messages
+    return status, deliverable_messages[:sent_count]
 
 
 async def send_saved_report(
@@ -313,7 +346,7 @@ async def send_saved_report(
     status: str,
     delivered_messages: list[object],
 ) -> None:
-    """Send execution report to Saved Messages ('me') and batch forward delivered files."""
+    """Send execution report to Saved Messages ('me') and safely forward delivered files."""
     user_status_flow = task.progress.get_rendered_text()
 
     report = (
@@ -330,10 +363,7 @@ async def send_saved_report(
     try:
         await client.send_message("me", report, parse_mode="html")
         if delivered_messages:
-            try:
-                await client.forward_messages("me", delivered_messages)
-            except Exception as e:
-                logging.error("Failed to batch forward content to Saved Messages: %s", e)
+            await safe_forward_messages(client, "me", delivered_messages)
     except Exception as e:
         logging.error("Failed to send task report to Saved Messages: %s", e)
 
