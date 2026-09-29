@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  fuckjoin:
+    build: .
+    container_name: fuckjoin
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist dynamically allowed users & joined channel tracking
+      - ./data:/app/data
+      # Persist Telegram session file across container rebuilds
+      - ./sessions:/app/sessions
+    stdin_open: true # Allows interactive terminal for 1st-time phone login
+    tty: true        # Keeps TTY open for entering verification codes
