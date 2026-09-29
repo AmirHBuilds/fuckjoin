@@ -1,4 +1,4 @@
-"""Listen to messages/forwards and run Telegram delivery flows."""
+"""Listen to messages/forwards and run Telegram delivery flows with admin control and cancellation."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
@@ -38,6 +38,7 @@ from .settings import (
     parse_requester_ids,
     parse_retry_delay,
 )
+from .user_manager import UserManager
 
 RESPONSE_TIMEOUT_SECONDS = 30
 MAX_START_ATTEMPTS = 5
@@ -47,15 +48,21 @@ FOLLOWUP_WINDOW_SECONDS = 2
 MAX_QUEUE_SIZE = 100
 
 
+class DeliveryCancelledError(Exception):
+    """Raised when an in-progress delivery task is cancelled by the user."""
+
+
 @dataclass
 class DeliveryTask:
-    """One request waiting for the delivery worker."""
+    """One request waiting for or running in the delivery worker."""
 
+    task_id: str
     command: str
     progress: ProgressReporter
     recipient: str | int
     sender_id: int
     sender_info: str
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def load_env(path: str = ".env") -> None:
@@ -70,15 +77,27 @@ def load_env(path: str = ".env") -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
+async def interruptible_sleep(duration: float, cancel_event: asyncio.Event) -> None:
+    """Sleep for duration, but return immediately if cancel_event is set."""
+    if cancel_event.is_set():
+        raise DeliveryCancelledError()
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=duration)
+        raise DeliveryCancelledError()
+    except asyncio.TimeoutError:
+        pass
+
+
 async def safe_forward_messages(
     client: TelegramClient,
     recipient: str | int,
     messages: list[object],
     progress: ProgressReporter | None = None,
+    cancel_event: asyncio.Event | None = None,
     chunk_size: int = 5,
     delay_between_chunks: float = 1.5,
 ) -> int:
-    """Forward messages in safe chunk sizes with visible FloodWait handling."""
+    """Forward messages in safe chunk sizes with FloodWait and cancellation handling."""
     sent = 0
     valid_messages = [
         msg for msg in messages 
@@ -88,8 +107,13 @@ async def safe_forward_messages(
         return 0
 
     for i in range(0, len(valid_messages), chunk_size):
+        if cancel_event and cancel_event.is_set():
+            raise DeliveryCancelledError()
+
         chunk = valid_messages[i : i + chunk_size]
         for attempt in range(3):
+            if cancel_event and cancel_event.is_set():
+                raise DeliveryCancelledError()
             try:
                 res = await client.forward_messages(recipient, chunk)
                 if isinstance(res, list):
@@ -97,16 +121,21 @@ async def safe_forward_messages(
                 elif res:
                     sent += len(chunk)
                 if i + chunk_size < len(valid_messages):
-                    await asyncio.sleep(delay_between_chunks)
+                    if cancel_event:
+                        await interruptible_sleep(delay_between_chunks, cancel_event)
+                    else:
+                        await asyncio.sleep(delay_between_chunks)
                 break
             except FloodWaitError as err:
                 msg = f"[ⴵ] Rate limit: waiting {err.seconds}s before retrying forward..."
-                print(f"\n{msg}", flush=True)
                 logging.warning(msg)
                 if progress:
                     await progress.report(msg)
 
-                await asyncio.sleep(err.seconds + 1)
+                if cancel_event:
+                    await interruptible_sleep(err.seconds + 1, cancel_event)
+                else:
+                    await asyncio.sleep(err.seconds + 1)
 
                 if progress:
                     await progress.report("[➴] Resuming content delivery...")
@@ -118,17 +147,22 @@ async def safe_forward_messages(
                 break
     return sent
 
+
 async def join_urls(
     client: TelegramClient,
     urls: set[str],
     progress: ProgressReporter,
     tracker: ChannelTracker,
     pacing_delay: float,
+    cancel_event: asyncio.Event,
 ) -> tuple[int, list[str]]:
-    """Join supported URLs, editing the progress line in-place, and recording joins."""
+    """Join supported URLs with cancellation checkpoints."""
     resolved = 0
     failures: list[str] = []
     for url in urls:
+        if cancel_event.is_set():
+            raise DeliveryCancelledError()
+
         try:
             parse_start_link(url)
             continue
@@ -143,6 +177,8 @@ async def join_urls(
         await progress.report(f"[➥] Joining {channel_name}")
 
         for attempt in range(2):
+            if cancel_event.is_set():
+                raise DeliveryCancelledError()
             try:
                 if kind == "invite":
                     updates = await client(ImportChatInviteRequest(value))
@@ -156,7 +192,7 @@ async def join_urls(
                 resolved += 1
                 await progress.report(f"[✓] Joined {channel_name}", in_place=True)
                 if pacing_delay > 0:
-                    await asyncio.sleep(pacing_delay)
+                    await interruptible_sleep(pacing_delay, cancel_event)
                 break
             except UserAlreadyParticipantError:
                 resolved += 1
@@ -171,7 +207,7 @@ async def join_urls(
                     f"[ⴵ] Rate limit: waiting {error.seconds}s before retrying {channel_name}",
                     in_place=True,
                 )
-                await asyncio.sleep(error.seconds)
+                await interruptible_sleep(error.seconds, cancel_event)
                 await progress.report(f"[➥] Re-joining {channel_name}")
             except (RPCError, TypeError) as error:
                 logging.info("Could not join %s: %s", url, error.__class__.__name__)
@@ -194,10 +230,24 @@ def response_links(message: object) -> set[str]:
     return links
 
 
-async def get_actionable_response(conversation: object, transient_texts: list[str]) -> object:
-    """Skip short-lived spinner messages, waiting for the bot's next actual response."""
+async def get_actionable_response(
+    conversation: object, transient_texts: list[str], cancel_event: asyncio.Event
+) -> object:
+    """Skip short-lived spinner messages with cancellation checks."""
     for _ in range(MAX_TRANSIENT_RESPONSES):
-        response = await conversation.get_response()
+        if cancel_event.is_set():
+            raise DeliveryCancelledError()
+        response_task = asyncio.create_task(conversation.get_response())
+        cancel_waiter = asyncio.create_task(cancel_event.wait())
+        done, _ = await asyncio.wait([response_task, cancel_waiter], return_when=asyncio.FIRST_COMPLETED)
+
+        if cancel_event.is_set():
+            response_task.cancel()
+            raise DeliveryCancelledError()
+
+        cancel_waiter.cancel()
+        response = response_task.result()
+
         if not is_transient_response(response, transient_texts):
             return response
         logging.info("Ignoring transient bot wait indicator")
@@ -205,11 +255,16 @@ async def get_actionable_response(conversation: object, transient_texts: list[st
 
 
 async def collect_followups(
-    conversation: object, first_response: object, transient_texts: list[str]
+    conversation: object,
+    first_response: object,
+    transient_texts: list[str],
+    cancel_event: asyncio.Event,
 ) -> list[object]:
-    """Collect additional bot messages that arrive shortly after the first response."""
+    """Collect additional bot messages arriving shortly after first response."""
     messages = [first_response]
     while True:
+        if cancel_event.is_set():
+            raise DeliveryCancelledError()
         try:
             message = await asyncio.wait_for(
                 conversation.get_response(), timeout=FOLLOWUP_WINDOW_SECONDS
@@ -228,13 +283,17 @@ async def run_bot_flow(
     tracker: ChannelTracker,
     pacing_delay: float,
     transient_texts: list[str],
+    cancel_event: asyncio.Event,
 ) -> tuple[list[object], int, list[str]]:
-    """Run one bot's start/join/retry sequence and return its responses."""
+    """Run one bot's start/join/retry sequence."""
+    if cancel_event.is_set():
+        raise DeliveryCancelledError()
+
     bot = await client.get_entity(start.bot)
     async with client.conversation(bot, timeout=RESPONSE_TIMEOUT_SECONDS) as conversation:
         await progress.report(f"[⌲] Sending /start to @{start.bot}")
         await conversation.send_message(f"/start {start.argument}")
-        response = await get_actionable_response(conversation, transient_texts)
+        response = await get_actionable_response(conversation, transient_texts, cancel_event)
         await progress.report(f"[⎙] Received response from @{start.bot}")
 
         joined_total = 0
@@ -242,6 +301,9 @@ async def run_bot_flow(
         seen_links: set[str] = set()
 
         for _ in range(MAX_START_ATTEMPTS):
+            if cancel_event.is_set():
+                raise DeliveryCancelledError()
+
             links = response_links(response) - seen_links
             seen_links.update(links)
             channel_count = sum(
@@ -254,7 +316,7 @@ async def run_bot_flow(
                 await progress.report(f"[⫶☰] Bot lists {channel_count} channel requirement(s)")
 
             resolved, join_failures = await join_urls(
-                client, links, progress, tracker, pacing_delay
+                client, links, progress, tracker, pacing_delay, cancel_event
             )
             joined_total += resolved
             failures.extend(join_failures)
@@ -263,13 +325,13 @@ async def run_bot_flow(
                 break
             if retry_delay_seconds:
                 await progress.report(f"[ⴵ] Waiting {retry_delay_seconds:g}s before retry")
-                await asyncio.sleep(retry_delay_seconds)
+                await interruptible_sleep(retry_delay_seconds, cancel_event)
             await progress.report(f"[↺⌲] Re-sending /start to @{start.bot}")
             await conversation.send_message(f"/start {start.argument}")
-            response = await get_actionable_response(conversation, transient_texts)
+            response = await get_actionable_response(conversation, transient_texts, cancel_event)
             await progress.report(f"[⎙] Received updated response from @{start.bot}")
 
-        messages = await collect_followups(conversation, response, transient_texts)
+        messages = await collect_followups(conversation, response, transient_texts, cancel_event)
 
     return messages, joined_total, failures
 
@@ -284,8 +346,12 @@ async def deliver(
     pacing_delay: float,
     transient_texts: list[str],
     blocked_words: list[str],
+    cancel_event: asyncio.Event,
 ) -> tuple[str, list[object]]:
-    """Fetch to Saved Messages first (instant), then relay to user safely."""
+    """Fetch content and deliver to recipient."""
+    if cancel_event.is_set():
+        raise DeliveryCancelledError()
+
     try:
         start = parse_start_link(command)
     except ValueError as error:
@@ -299,8 +365,17 @@ async def deliver(
     responses: list[object] = []
 
     for _ in range(MAX_BOT_HANDOFFS):
+        if cancel_event.is_set():
+            raise DeliveryCancelledError()
         responses, joined, join_failures = await run_bot_flow(
-            client, current, retry_delay_seconds, progress, tracker, pacing_delay, transient_texts
+            client,
+            current,
+            retry_delay_seconds,
+            progress,
+            tracker,
+            pacing_delay,
+            transient_texts,
+            cancel_event,
         )
         joined_total += joined
         failures.extend(join_failures)
@@ -322,9 +397,11 @@ async def deliver(
         handoffs += 1
         await progress.report(f"[→] Following handoff to @{current.bot}")
 
+    if cancel_event.is_set():
+        raise DeliveryCancelledError()
+
     failure_note = f" Could not join: {'; '.join(failures)}." if failures else ""
 
-    # Filter out blocked text-only messages and messages with forwarding restrictions
     deliverable_messages: list[object] = []
     await progress.report(f"[✶] Fetching {len(responses)} final message(s)")
     for response in responses:
@@ -340,7 +417,6 @@ async def deliver(
         status = f"[✗] Cannot deliver: No valid content or protection enabled.{failure_note}"
         return status, []
 
-    # STAGE 1: Instantly back up all items to Saved Messages before they auto-delete
     try:
         saved_backup = await client.forward_messages("me", deliverable_messages)
         if not isinstance(saved_backup, list):
@@ -349,7 +425,9 @@ async def deliver(
         logging.error("Failed to back up to Saved Messages: %s", e)
         saved_backup = deliverable_messages
 
-    # STAGE 2: If the recipient is not 'me', relay from Saved Messages to the requester
+    if cancel_event.is_set():
+        raise DeliveryCancelledError()
+
     if recipient != "me":
         await progress.report("[➴] Sending content to requester")
         sent_count = await safe_forward_messages(
@@ -357,6 +435,7 @@ async def deliver(
             recipient=recipient,
             messages=saved_backup,
             progress=progress,
+            cancel_event=cancel_event,
         )
     else:
         sent_count = len(saved_backup)
@@ -370,6 +449,7 @@ async def deliver(
     )
     return status, saved_backup[:sent_count]
 
+
 async def send_saved_report(
     client: TelegramClient,
     task: DeliveryTask,
@@ -378,8 +458,6 @@ async def send_saved_report(
 ) -> None:
     """Send execution report summary to Saved Messages ('me')."""
     user_status_flow = task.progress.get_rendered_text()
-    
-    # Truncate process logs if they are too long for a single Telegram message
     if len(user_status_flow) > 3000:
         user_status_flow = user_status_flow[:3000] + "\n...[truncated]"
 
@@ -398,11 +476,8 @@ async def send_saved_report(
     )
     try:
         await client.send_message("me", report, parse_mode="html")
-        print("[✓] Report sent to Saved Messages", flush=True)
-    except Exception as e:
-        logging.error("Failed to send task report to Saved Messages: %s", e)
-        # Fallback to plain text in case HTML parsing failed
-        try:
+    except Exception:
+        with suppress(Exception):
             plain_report = (
                 f"[Task Report]\nStatus: {status}\n\n"
                 f"User: {task.sender_info}\n"
@@ -411,8 +486,7 @@ async def send_saved_report(
                 f"Sent: {count} message(s)"
             )
             await client.send_message("me", plain_report)
-        except Exception as inner_e:
-            logging.error("Fallback report also failed: %s", inner_e)
+
 
 async def process_tasks(
     queue: asyncio.Queue[DeliveryTask],
@@ -422,14 +496,18 @@ async def process_tasks(
     pacing_delay: float,
     transient_texts: list[str],
     blocked_words: list[str],
+    active_tasks: dict[str, DeliveryTask],
 ) -> None:
     """Process requests sequentially."""
     while True:
         task = await queue.get()
+        active_tasks[task.task_id] = task
         delivered_messages: list[object] = []
         status = "Unknown"
-        is_success = False
         try:
+            if task.cancel_event.is_set():
+                raise DeliveryCancelledError()
+
             await task.progress.report("[★] Started")
             status, delivered_messages = await deliver(
                 client=client,
@@ -441,6 +519,7 @@ async def process_tasks(
                 pacing_delay=pacing_delay,
                 transient_texts=transient_texts,
                 blocked_words=blocked_words,
+                cancel_event=task.cancel_event,
             )
             is_success = bool(delivered_messages)
             await task.progress.report(
@@ -449,6 +528,9 @@ async def process_tasks(
                 failed=not is_success,
                 sent_count=len(delivered_messages),
             )
+        except DeliveryCancelledError:
+            status = "[⊘] Process was cancelled by user."
+            await task.progress.report(status, cancelled=True, sent_count=0)
         except TimeoutError:
             status = "[✗] Timed out waiting for bot response"
             await task.progress.report(status, failed=True, sent_count=0)
@@ -461,8 +543,10 @@ async def process_tasks(
             status = f"[✗] Error: {error.__class__.__name__}: {error}"
             await task.progress.report(status, failed=True, sent_count=0)
         finally:
+            active_tasks.pop(task.task_id, None)
             await send_saved_report(client, task, status, delivered_messages)
             queue.task_done()
+
 
 async def enqueue_link(
     queue: asyncio.Queue[DeliveryTask],
@@ -470,34 +554,38 @@ async def enqueue_link(
     target_link: str,
     recipient: str | int,
     user_info: str,
+    active_tasks: dict[str, DeliveryTask],
 ) -> None:
     """Send initial progress card and enqueue job."""
-    initial_body = "<b>[⏳ Delivery in progress]</b>\n<pre>[★] Queued</pre>"
-    message = await event.reply(initial_body, parse_mode="html")
-    progress = ProgressReporter(message)
+    task_id = str(uuid.uuid4())[:8]
+    initial_body = (
+        "<b>[⏳ Delivery in progress]</b>\n"
+        "<pre>[★] Queued</pre>\n\n"
+        "💡 <i>Tip: Send <code>/cancel</code> or <code>cancel</code> to stop.</i>"
+    )
+    message = await event.reply(initial_body, parse_mode="html", buttons=Button.clear())
+
+    progress = ProgressReporter(message=message, task_id=task_id)
+    task = DeliveryTask(
+        task_id=task_id,
+        command=target_link,
+        progress=progress,
+        recipient=recipient,
+        sender_id=event.sender_id,
+        sender_info=user_info,
+    )
+    active_tasks[task_id] = task
+
     try:
-        queue.put_nowait(
-            DeliveryTask(
-                command=target_link,
-                progress=progress,
-                recipient=recipient,
-                sender_id=event.sender_id,
-                sender_info=user_info,
-            )
-        )
+        queue.put_nowait(task)
     except asyncio.QueueFull:
-        await progress.report("[✗] Queue is full; please try again later", failed=True, sent_count=0)
-def handle_task_exception(task: asyncio.Task) -> None:
-    """Print uncaught exceptions from background workers immediately."""
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logging.exception("Unhandled crash in background worker:")
+        active_tasks.pop(task_id, None)
+        await progress.report(
+            "[✗] Queue is full; please try again later", failed=True, sent_count=0
+        )
+
 
 async def main() -> None:
-    # Suppress verbose missing-mapping warnings from Telethon internals
     logging.getLogger("telethon").setLevel(logging.INFO)
     load_env()
     api_id = int(os.environ["API_ID"])
@@ -505,52 +593,163 @@ async def main() -> None:
     retry_delay_seconds = parse_retry_delay(os.environ.get("RETRY_DELAY_SECONDS"))
     pacing_delay = float(os.environ.get("JOIN_PACING_DELAY_SECONDS", "3"))
     max_channels = parse_int_setting(os.environ.get("MAX_JOINED_CHANNELS"), default=100)
-    allowed_requester_ids = parse_requester_ids(os.environ.get("ALLOWED_REQUESTER_IDS"))
+
+    # ADMINS: Has full control and can use /admin, /add_user, /state, etc.
+    admins = parse_requester_ids(os.environ.get("ADMINS"))
 
     default_transients = ["...", "please wait", "processing...", "⏳", "⌛"]
     transient_texts = parse_csv_list(os.environ.get("TRANSIENT_TEXTS"), default=default_transients)
     blocked_words = parse_csv_list(os.environ.get("BLOCKED_TEXT_WORDS"), default=[])
 
-    client = TelegramClient(os.environ.get("SESSION_NAME", "telegram-automation"), api_id, api_hash,flood_sleep_threshold=0)
+    client = TelegramClient(
+        os.environ.get("SESSION_NAME", "telegram-automation"),
+        api_id,
+        api_hash,
+        flood_sleep_threshold=0,
+    )
     queue: asyncio.Queue[DeliveryTask] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     tracker = ChannelTracker()
+    user_manager = UserManager()
 
-    pending_choices: dict[str, dict] = {}
-
-    @client.on(events.CallbackQuery)
-    async def handle_choice(event: events.CallbackQuery.Event) -> None:
-        data = event.data.decode("utf-8", errors="ignore")
-        if not data.startswith("dl:"):
-            return
-        token = data.removeprefix("dl:")
-        choice_data = pending_choices.pop(token, None)
-        if not choice_data:
-            await event.answer("This selection has expired.")
-            return
-
-        await event.answer("Starting download...")
-        await event.delete()
-
-        await enqueue_link(
-            queue=queue,
-            event=choice_data["event"],
-            target_link=choice_data["url"],
-            recipient=choice_data["recipient"],
-            user_info=choice_data["user_info"],
-        )
+    pending_user_choices: dict[int, dict[str, dict]] = {}
+    active_tasks: dict[str, DeliveryTask] = {}
 
     @client.on(events.NewMessage)
     async def handle_message(event: events.NewMessage.Event) -> None:
         me = await client.get_me()
 
-        if event.out:
-            if event.chat_id != me.id:
+        is_self = event.out and event.chat_id == me.id
+        sender_id = me.id if is_self else event.sender_id
+
+        # Determine authorization
+        allowed_users = await user_manager.get_allowed_users()
+        is_admin = is_self or (sender_id in admins)
+        is_allowed_user = sender_id in allowed_users
+
+        # Reject unauthorized requests in private messages
+        if not is_self:
+            if not event.is_private or not (is_admin or is_allowed_user):
                 return
-            recipient: str | int = "me"
-        elif event.is_private and (not allowed_requester_ids or event.sender_id in allowed_requester_ids):
-            recipient = event.sender_id
-        else:
+
+        recipient: str | int = "me" if is_self else sender_id
+        text = (event.raw_text or "").strip()
+        lower_text = text.lower()
+
+        # --- ADMIN-ONLY COMMANDS ---
+        if is_admin:
+            # /admin or admin command list
+            if lower_text in {"/admin", "admin"}:
+                admin_help = (
+                    "<b>🛠️ Admin Dashboard</b>\n\n"
+                    "<b>Commands:</b>\n"
+                    "• <code>/state</code> - View system status and allowed users\n"
+                    "• <code>/add_user &lt;id&gt;</code> - Grant bot access to a user\n"
+                    "• <code>/remove_user &lt;id&gt;</code> - Revoke user access\n"
+                    "• <code>/cancel</code> - Cancel your running download\n\n"
+                    "<i>Allowed users can only send bot links and cancel their tasks.</i>"
+                )
+                admin_menu = [
+                    [Button.text("/state", resize=True), Button.text("/admin", resize=True)],
+                    [Button.text("/cancel", resize=True)],
+                ]
+                await event.reply(admin_help, parse_mode="html", buttons=admin_menu)
+                return
+
+            # /state command
+            if lower_text in {"/state", "state"}:
+                current_allowed = sorted(list(allowed_users))
+                users_list_str = (
+                    "\n".join([f"  • <code>{uid}</code>" for uid in current_allowed])
+                    if current_allowed
+                    else "<i>None</i>"
+                )
+                admin_list_str = (
+                    ", ".join([f"<code>{aid}</code>" for aid in admins])
+                    if admins
+                    else f"<code>{me.id}</code> (Session Owner)"
+                )
+
+                state_msg = (
+                    "<b>📊 Automation State Report</b>\n\n"
+                    f"<b>Admins:</b> {admin_list_str}\n"
+                    f"<b>Active Worker Tasks:</b> {len(active_tasks)}\n"
+                    f"<b>Pending Queue Size:</b> {queue.qsize()}/{MAX_QUEUE_SIZE}\n\n"
+                    f"<b>Allowed Users ({len(current_allowed)}):</b>\n{users_list_str}"
+                )
+                await event.reply(state_msg, parse_mode="html")
+                return
+
+            # /add_user <user_id>
+            if lower_text.startswith("/add_user ") or lower_text.startswith("add_user "):
+                parts = text.split()
+                if len(parts) < 2 or not parts[1].isdigit():
+                    await event.reply("⚠️ Usage: <code>/add_user 123456789</code>", parse_mode="html")
+                    return
+                new_user_id = int(parts[1])
+                added = await user_manager.add_user(new_user_id)
+                if added:
+                    await event.reply(f"✅ User <code>{new_user_id}</code> is now allowed to use the bot.", parse_mode="html")
+                else:
+                    await event.reply(f"ℹ️ User <code>{new_user_id}</code> was already in the allowed list.", parse_mode="html")
+                return
+
+            # /remove_user <user_id>
+            if lower_text.startswith("/remove_user ") or lower_text.startswith("remove_user "):
+                parts = text.split()
+                if len(parts) < 2 or not parts[1].isdigit():
+                    await event.reply("⚠️ Usage: <code>/remove_user 123456789</code>", parse_mode="html")
+                    return
+                remove_id = int(parts[1])
+                removed = await user_manager.remove_user(remove_id)
+                if removed:
+                    await event.reply(f"🗑️ User <code>{remove_id}</code> has been removed.", parse_mode="html")
+                else:
+                    await event.reply(f"ℹ️ User <code>{remove_id}</code> is not in the allowed list.", parse_mode="html")
+                return
+
+        # --- USER & ADMIN COMMON COMMANDS ---
+
+        # Cancellation
+        if lower_text in {"/cancel", "cancel"}:
+            cancelled_any = False
+            for task in list(active_tasks.values()):
+                if task.sender_id == sender_id or (is_self and recipient == "me"):
+                    task.cancel_event.set()
+                    cancelled_any = True
+
+            pending_user_choices.pop(sender_id, None)
+
+            if cancelled_any:
+                await event.reply("[⊘] Cancellation signal sent. Halting operation...", buttons=Button.clear())
+            else:
+                await event.reply("No active tasks found to cancel.", buttons=Button.clear())
             return
+
+        # Handle multiple choice answers
+        if sender_id in pending_user_choices:
+            user_choices = pending_user_choices[sender_id]
+            matched_key = None
+
+            if text in user_choices:
+                matched_key = text
+            else:
+                for k, v in user_choices.items():
+                    if text == v["label"] or text == f"{k}. {v['label']}":
+                        matched_key = k
+                        break
+
+            if matched_key:
+                chosen = user_choices[matched_key]
+                del pending_user_choices[sender_id]
+                await enqueue_link(
+                    queue=queue,
+                    event=event,
+                    target_link=chosen["url"],
+                    recipient=chosen["recipient"],
+                    user_info=chosen["user_info"],
+                    active_tasks=active_tasks,
+                )
+                return
 
         bot_links = extract_bot_start_links_with_labels(event.message)
         if not bot_links:
@@ -560,25 +759,38 @@ async def main() -> None:
         first_name = getattr(sender, "first_name", "") or ""
         last_name = getattr(sender, "last_name", "") or ""
         username = f"@{sender.username}" if getattr(sender, "username", None) else "No Username"
-        user_info = f"Name: {escape(first_name + ' ' + last_name).strip()} | {escape(username)} | ID: <code>{event.sender_id}</code>"
+        user_info = f"Name: {escape(first_name + ' ' + last_name).strip()} | {escape(username)} | ID: <code>{sender_id}</code>"
 
         if len(bot_links) == 1:
-            await enqueue_link(queue, event, bot_links[0].url, recipient, user_info)
+            await enqueue_link(queue, event, bot_links[0].url, recipient, user_info, active_tasks)
             return
 
-        buttons = []
+        # Multi-link selection menu
+        keyboard_buttons = []
+        user_choices_map = {}
+        prompt_lines = ["Multiple links detected. Tap an option or send its number:\n"]
+
         for index, item in enumerate(bot_links, start=1):
-            token = str(uuid.uuid4())[:8]
-            pending_choices[token] = {
-                "event": event,
+            key = str(index)
+            label = item.label or f"Option {index}"
+            user_choices_map[key] = {
                 "url": item.url,
+                "label": label,
                 "recipient": recipient,
                 "user_info": user_info,
             }
-            btn_title = f"{index}. {item.label}"
-            buttons.append([Button.inline(btn_title, data=f"dl:{token}")])
+            button_text = f"{index}. {label}"
+            keyboard_buttons.append([Button.text(button_text, resize=True, single_use=True)])
+            prompt_lines.append(f"<b>{index}.</b> {escape(label)}")
 
-        await event.reply("Multiple links detected. Choose one to start:", buttons=buttons)
+        pending_user_choices[sender_id] = user_choices_map
+        prompt_lines.append("\n<i>Send <code>/cancel</code> to abort.</i>")
+
+        await event.reply(
+            "\n".join(prompt_lines),
+            parse_mode="html",
+            buttons=keyboard_buttons,
+        )
 
     await client.start()
     worker = asyncio.create_task(
@@ -590,6 +802,7 @@ async def main() -> None:
             pacing_delay=pacing_delay,
             transient_texts=transient_texts,
             blocked_words=blocked_words,
+            active_tasks=active_tasks,
         )
     )
     cleanup_worker = asyncio.create_task(
