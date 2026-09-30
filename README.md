@@ -71,7 +71,7 @@ Telegram is flooded with file lockers demanding:
 ### 1. Clone & Configure
 
 ```bash
-git clone https://github.com/yourusername/fuckjoin.git
+git clone https://github.com/AmirHBuilds/fuckjoin
 cd fuckjoin
 cp .env.example .env
 ```
