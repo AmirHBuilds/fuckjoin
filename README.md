@@ -42,6 +42,15 @@ Telegram is flooded with file lockers demanding:
 | <!-- Screenshot Size: 600x400px --> <img src="assets/step1-selection.png" width="400" alt="Link Selection Prompt"/> | <!-- Screenshot Size: 600x400px --> <img src="assets/step2-delivery.png" width="400" alt="Delivery Progress and Result"/> |
 | Multi-link selector menus with instant tap | Live progress cards with instant `/cancel` |
 
+<br/>
+
+### 🛠️ Dedicated Admin Console
+
+<!-- Screenshot Size: 800x450px -->
+<img src="assets/step3-admin.png" width="600" alt="Admin Dashboard and State Report"/>
+
+*Manage user authorization (`/add_user`, `/remove_user`) and monitor active worker tasks (`/state`) on the fly.*
+
 </div>
 
 ---
