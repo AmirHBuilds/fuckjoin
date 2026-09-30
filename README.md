@@ -147,13 +147,6 @@ python -m src
 
 ---
 
-## 📖 Deep Dive
-
-Curious about channel rotation cycles, transient bot response filtration, or concurrency architecture?  
-Check out [**TECHNICAL.md**](TECHNICAL.md).
-
----
-
 ## ⚖️ Disclaimer
 
 *fuckjoin is designed as a personal workflow automation utility under Telegram's Terms of Service. Please respect content rights and adhere to community guidelines.*
