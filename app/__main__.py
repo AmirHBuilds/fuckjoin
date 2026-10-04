@@ -185,8 +185,11 @@ async def join_urls(
             try:
                 if kind == "invite":
                     updates = await client(ImportChatInviteRequest(value))
-                    chat = updates.chats[0] if getattr(updates, "chats", None) else value
-                    await tracker.record_join(getattr(chat, "id", value))
+                    chat = updates.chats[0] if getattr(updates, "chats", None) else None
+                    # No chat in the reply means a join request is pending (not joined yet),
+                    # so there is nothing to leave later; don't track the invite hash.
+                    if chat is not None and getattr(chat, "id", None):
+                        await tracker.record_join(chat.id)
                 else:
                     channel = await client.get_input_entity(value)
                     await client(JoinChannelRequest(channel))
@@ -729,6 +732,11 @@ async def main() -> None:
                     "<b>🧹 Cleanup finished</b>",
                     f"• Channels left: <b>{res.channels_left}</b>"
                     + (f" ({res.channels_failed} failed)" if res.channels_failed else ""),
+                    *(
+                        [f"• Stale entries dropped: <b>{res.channels_stale}</b> (never actually joined)"]
+                        if res.channels_stale
+                        else []
+                    ),
                     f"• Bots deleted &amp; blocked: <b>{res.bots_cleaned}</b>"
                     + (f" ({res.bots_failed} failed)" if res.bots_failed else ""),
                 ]

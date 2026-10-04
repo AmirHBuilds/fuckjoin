@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
+from telethon.tl.types import PeerChannel
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
@@ -25,6 +26,7 @@ class CleanupResult:
 
     channels_left: int = 0
     channels_failed: int = 0
+    channels_stale: int = 0
     bots_cleaned: int = 0
     bots_failed: int = 0
     rate_limited: bool = False
@@ -95,9 +97,17 @@ class ChannelTracker:
 
         # 1. Leave channels
         for index, ch_id in enumerate(channel_ids):
+            if not ch_id.lstrip("-").isdigit():
+                # Old entries saved an invite hash instead of a channel id (join request
+                # pending / never joined). Nothing to leave, just drop them.
+                result.channels_stale += 1
+                async with self.lock:
+                    current = self._read_data()
+                    current.pop(ch_id, None)
+                    self._write_data(current)
+                continue
             try:
-                entity_id = int(ch_id) if ch_id.lstrip("-").isdigit() else ch_id
-                entity = await client.get_input_entity(entity_id)
+                entity = await client.get_input_entity(PeerChannel(abs(int(ch_id))))
                 await client(LeaveChannelRequest(entity))
                 result.channels_left += 1
                 logging.info("Cleanup: left channel %s", ch_id)
