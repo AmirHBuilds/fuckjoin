@@ -9,13 +9,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
-from telethon.errors import RPCError
-from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import Channel, ChatInviteAlready, ChatInvitePeek, PeerChannel
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
-from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, DeleteHistoryRequest
+from telethon.tl.types import (
+    Channel,
+    ChatInviteAlready,
+    ChatInvitePeek,
+    InputPeerChannel,
+    PeerChannel,
+)
 
 DATA_FILE = Path("data/joined_channels.json")
 BOTS_FILE = Path("data/interacted_bots.json")
@@ -96,6 +100,21 @@ class ChannelTracker:
             return info.chat
         return None
 
+    async def _leave_one(self, client: TelegramClient, ch_id: str) -> bool:
+        """Leave one tracked chat. Returns False if we are not a member / it can't be resolved."""
+        if ch_id.lstrip("-").isdigit():
+            entity = await client.get_input_entity(PeerChannel(abs(int(ch_id))))
+        else:
+            # Invite hash saved from a join-request link: resolve it to the real chat.
+            entity = await self._entity_from_invite(client, ch_id)
+            if entity is None:
+                return False
+        if isinstance(entity, (Channel, InputPeerChannel)):
+            await client(LeaveChannelRequest(entity))
+        else:
+            await client.delete_dialog(entity)  # basic group
+        return True
+
     async def cleanup_all(self, client: TelegramClient, delay: float = 1.5) -> CleanupResult:
         """Leave all tracked channels, then delete + block all tracked bots.
 
@@ -111,24 +130,11 @@ class ChannelTracker:
         # 1. Leave channels
         for index, ch_id in enumerate(channel_ids):
             try:
-                if ch_id.lstrip("-").isdigit():
-                    entity = await client.get_input_entity(PeerChannel(abs(int(ch_id))))
+                if await self._leave_one(client, ch_id):
+                    result.channels_left += 1
+                    logging.info("Cleanup: left channel %s", ch_id)
                 else:
-                    # Invite hash saved from a join-request link: resolve it to the real chat.
-                    entity = await self._entity_from_invite(client, ch_id)
-                    if entity is None:
-                        result.channels_stale += 1
-                        async with self.lock:
-                            current = self._read_data()
-                            current.pop(ch_id, None)
-                            self._write_data(current)
-                        continue
-                if isinstance(entity, Channel):
-                    await client(LeaveChannelRequest(entity))
-                else:
-                    await client.delete_dialog(entity)
-                result.channels_left += 1
-                logging.info("Cleanup: left channel %s", ch_id)
+                    result.channels_stale += 1
             except FloodWaitError as e:
                 logging.warning("FloodWait during cleanup: %ss", e.seconds)
                 result.rate_limited = True
@@ -212,18 +218,22 @@ class ChannelTracker:
                 # Process channel exits with delay
                 for ch_id in to_leave:
                     try:
-                        entity_id = int(ch_id) if ch_id.lstrip("-").isdigit() else ch_id
-                        entity = await client.get_input_entity(entity_id)
-                        await client(LeaveChannelRequest(entity))
-                        logging.info("Left tracked channel: %s", ch_id)
+                        if await self._leave_one(client, ch_id):
+                            logging.info("Left tracked channel: %s", ch_id)
+                        else:
+                            logging.info("Dropped untracked/unjoined entry: %s", ch_id)
+                    except FloodWaitError as e:
+                        # Keep the entry tracked and retry after the rate limit passes.
+                        logging.warning("FloodWait while leaving channels: %ss", e.seconds)
+                        await asyncio.sleep(min(e.seconds, 3600) + 1)
+                        break
                     except Exception as e:
                         logging.warning("Could not leave channel %s: %s", ch_id, e)
-                    finally:
-                        async with self.lock:
-                            current = self._read_data()
-                            current.pop(str(ch_id), None)
-                            self._write_data(current)
-                        await asyncio.sleep(leave_delay)
+                    async with self.lock:
+                        current = self._read_data()
+                        current.pop(str(ch_id), None)
+                        self._write_data(current)
+                    await asyncio.sleep(leave_delay)
             except asyncio.CancelledError:
                 break
             except Exception as e:

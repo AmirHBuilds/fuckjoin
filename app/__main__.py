@@ -850,6 +850,10 @@ async def main() -> None:
         if not bot_links:
             return
 
+        if tracker.cleanup_lock.locked():
+            await event.reply("🧹 Cleanup is running. Send the link again in a minute.")
+            return
+
         sender = await event.get_sender()
         first_name = getattr(sender, "first_name", "") or ""
         last_name = getattr(sender, "last_name", "") or ""

@@ -49,7 +49,7 @@ Telegram is flooded with file lockers demanding:
 <!-- Screenshot Size: 800x450px -->
 <img src="assets/step3-admin.png" width="600" alt="Admin Dashboard and State Report"/>
 
-*Manage user authorization (`/add_user`, `/remove_user`) and monitor active worker tasks (`/state`) on the fly.*
+*Manage user authorization (`/add_user`, `/remove_user`), monitor active worker tasks (`/state`) and wipe everything the bot touched with `/cleanup`.*
 
 </div>
 
@@ -59,6 +59,7 @@ Telegram is flooded with file lockers demanding:
 
 - 🎯 **Deep Link Unlocking:** Resolves nested bot handoffs, start parameters, and multi-step verification bots.
 - ⚡ **Auto Channel Cleanup:** Silently tracks joined channels in persistent storage and leaves them in the background.
+- 🧹 **One-Tap Cleanup:** `/cleanup` leaves every joined channel, deletes the chats with all bots it used and blocks them. Blocked bots are unblocked automatically the next time a link needs them.
 - 🛡️ **FloodWait Resilience:** Automatically absorbs and paces API rate limits without dropping in-flight jobs.
 - ⊘ **Instant Cancellation:** Interrupt any task on the fly by clicking or typing `/cancel`.
 - 👥 **Access Control:** Manage dynamic permissions on the fly using `/add_user` and `/state` without restarting.
