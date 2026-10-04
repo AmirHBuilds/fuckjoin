@@ -144,6 +144,7 @@ python -m src
 | `/state` | Admins Only | Displays active jobs, queue count, and authorized user IDs |
 | `/add_user <user_id>` | Admins Only | Grants bot access to a user |
 | `/remove_user <user_id>` | Admins Only | Revokes a user's bot access |
+| `/cleanup` | Admins Only (or Saved Messages) | Leaves all joined channels, deletes chats with and blocks every bot it used |
 
 ---
 

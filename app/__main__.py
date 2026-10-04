@@ -17,8 +17,10 @@ from telethon.errors.rpcerrorlist import (
     ChatForwardsRestrictedError,
     FloodWaitError,
     UserAlreadyParticipantError,
+    YouBlockedUserError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.contacts import UnblockRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 from .channel_tracker import ChannelTracker
@@ -46,6 +48,7 @@ MAX_BOT_HANDOFFS = 5
 MAX_TRANSIENT_RESPONSES = 10
 FOLLOWUP_WINDOW_SECONDS = 2
 MAX_QUEUE_SIZE = 100
+CLEANUP_DELAY_SECONDS = 1.5
 
 
 class DeliveryCancelledError(Exception):
@@ -275,6 +278,23 @@ async def collect_followups(
             messages.append(message)
 
 
+async def send_to_bot(
+    client: TelegramClient,
+    conversation: object,
+    bot: object,
+    text: str,
+    progress: ProgressReporter,
+) -> None:
+    """Send a message to a bot, automatically unblocking it first if it is blocked."""
+    try:
+        await conversation.send_message(text)
+    except YouBlockedUserError:
+        await progress.report(f"[⚿] @{getattr(bot, 'username', None) or bot.id} is blocked, unblocking")
+        await client(UnblockRequest(bot))
+        await progress.report("[✓] Unblocked", in_place=True)
+        await conversation.send_message(text)
+
+
 async def run_bot_flow(
     client: TelegramClient,
     start: StartLink,
@@ -290,9 +310,10 @@ async def run_bot_flow(
         raise DeliveryCancelledError()
 
     bot = await client.get_entity(start.bot)
+    await tracker.record_bot(bot.id, getattr(bot, "username", None) or start.bot)
     async with client.conversation(bot, timeout=RESPONSE_TIMEOUT_SECONDS) as conversation:
         await progress.report(f"[⌲] Sending /start to @{start.bot}")
-        await conversation.send_message(f"/start {start.argument}")
+        await send_to_bot(client, conversation, bot, f"/start {start.argument}", progress)
         response = await get_actionable_response(conversation, transient_texts, cancel_event)
         await progress.report(f"[⎙] Received response from @{start.bot}")
 
@@ -327,7 +348,7 @@ async def run_bot_flow(
                 await progress.report(f"[ⴵ] Waiting {retry_delay_seconds:g}s before retry")
                 await interruptible_sleep(retry_delay_seconds, cancel_event)
             await progress.report(f"[↺⌲] Re-sending /start to @{start.bot}")
-            await conversation.send_message(f"/start {start.argument}")
+            await send_to_bot(client, conversation, bot, f"/start {start.argument}", progress)
             response = await get_actionable_response(conversation, transient_texts, cancel_event)
             await progress.report(f"[⎙] Received updated response from @{start.bot}")
 
@@ -645,12 +666,14 @@ async def main() -> None:
                     "• <code>/state</code> - View system status and allowed users\n"
                     "• <code>/add_user &lt;id&gt;</code> - Grant bot access to a user\n"
                     "• <code>/remove_user &lt;id&gt;</code> - Revoke user access\n"
+                    "• <code>/cleanup</code> - Leave all joined channels, delete and block all bots it used\n"
                     "• <code>/cancel</code> - Cancel your running download\n\n"
+                    "<i>Blocked bots are unblocked automatically when you send a link that needs them.</i>\n"
                     "<i>Allowed users can only send bot links and cancel their tasks.</i>"
                 )
                 admin_menu = [
                     [Button.text("/state", resize=True), Button.text("/admin", resize=True)],
-                    [Button.text("/cancel", resize=True)],
+                    [Button.text("/cleanup", resize=True), Button.text("/cancel", resize=True)],
                 ]
                 await event.reply(admin_help, parse_mode="html", buttons=admin_menu)
                 return
@@ -677,6 +700,49 @@ async def main() -> None:
                     f"<b>Allowed Users ({len(current_allowed)}):</b>\n{users_list_str}"
                 )
                 await event.reply(state_msg, parse_mode="html")
+                return
+
+            # /cleanup
+            if lower_text in {"/cleanup", "cleanup"}:
+                if tracker.cleanup_lock.locked():
+                    await event.reply("ℹ️ A cleanup is already in progress.")
+                    return
+                if active_tasks:
+                    await event.reply(
+                        "⚠️ Deliveries are running or queued. Wait for them to finish "
+                        "or send <code>/cancel</code>, then try again.",
+                        parse_mode="html",
+                    )
+                    return
+                async with tracker.cleanup_lock:
+                    n_channels = tracker.channel_count()
+                    n_bots = tracker.bot_count()
+                    if not n_channels and not n_bots:
+                        await event.reply("ℹ️ Nothing to clean up.")
+                        return
+                    status_msg = await event.reply(
+                        f"🧹 Cleaning up: <b>{n_channels}</b> channel(s), <b>{n_bots}</b> bot(s)...",
+                        parse_mode="html",
+                    )
+                    res = await tracker.cleanup_all(client, delay=CLEANUP_DELAY_SECONDS)
+                lines = [
+                    "<b>🧹 Cleanup finished</b>",
+                    f"• Channels left: <b>{res.channels_left}</b>"
+                    + (f" ({res.channels_failed} failed)" if res.channels_failed else ""),
+                    f"• Bots deleted &amp; blocked: <b>{res.bots_cleaned}</b>"
+                    + (f" ({res.bots_failed} failed)" if res.bots_failed else ""),
+                ]
+                if res.rate_limited:
+                    lines.append(
+                        "⛔ Stopped by Telegram rate limit "
+                        f"({res.channels_remaining} channel(s), {res.bots_remaining} bot(s) left). "
+                        "Run <code>/cleanup</code> again later."
+                    )
+                result_text = "\n".join(lines)
+                try:
+                    await status_msg.edit(result_text, parse_mode="html")
+                except Exception:
+                    await event.reply(result_text, parse_mode="html")
                 return
 
             # /add_user <user_id>
