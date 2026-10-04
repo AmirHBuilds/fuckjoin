@@ -21,7 +21,8 @@ from telethon.errors.rpcerrorlist import (
 )
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.contacts import UnblockRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import ChatInviteAlready, ChatInvitePeek
 
 from .channel_tracker import ChannelTracker
 from .links import (
@@ -151,6 +152,24 @@ async def safe_forward_messages(
     return sent
 
 
+async def resolve_invite_chat_id(client: TelegramClient, invite_hash: str) -> int | None:
+    """Find the chat id behind an invite link once we are a member.
+
+    Many force-subscribe bots use "request to join" links and auto-approve the request a
+    moment later, so the import call returns no chat. Poll the invite until it reports us
+    as a member.
+    """
+    for _ in range(4):
+        await asyncio.sleep(1.5)
+        try:
+            info = await client(CheckChatInviteRequest(invite_hash))
+        except RPCError:
+            return None
+        if isinstance(info, (ChatInviteAlready, ChatInvitePeek)) and getattr(info.chat, "id", None):
+            return info.chat.id
+    return None
+
+
 async def join_urls(
     client: TelegramClient,
     urls: set[str],
@@ -186,10 +205,12 @@ async def join_urls(
                 if kind == "invite":
                     updates = await client(ImportChatInviteRequest(value))
                     chat = updates.chats[0] if getattr(updates, "chats", None) else None
-                    # No chat in the reply means a join request is pending (not joined yet),
-                    # so there is nothing to leave later; don't track the invite hash.
-                    if chat is not None and getattr(chat, "id", None):
-                        await tracker.record_join(chat.id)
+                    chat_id = getattr(chat, "id", None)
+                    if chat_id is None:
+                        # Join-request link (usually auto-approved by the bot): resolve the id.
+                        chat_id = await resolve_invite_chat_id(client, value)
+                    # If it still can't be resolved, keep the invite hash; /cleanup retries.
+                    await tracker.record_join(chat_id if chat_id is not None else value)
                 else:
                     channel = await client.get_input_entity(value)
                     await client(JoinChannelRequest(channel))
@@ -733,7 +754,7 @@ async def main() -> None:
                     f"• Channels left: <b>{res.channels_left}</b>"
                     + (f" ({res.channels_failed} failed)" if res.channels_failed else ""),
                     *(
-                        [f"• Stale entries dropped: <b>{res.channels_stale}</b> (never actually joined)"]
+                        [f"• Unresolvable entries dropped: <b>{res.channels_stale}</b> (not a member / invite expired)"]
                         if res.channels_stale
                         else []
                     ),

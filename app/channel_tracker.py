@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
-from telethon.tl.types import PeerChannel
+from telethon.errors import RPCError
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.tl.types import Channel, ChatInviteAlready, ChatInvitePeek, PeerChannel
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
@@ -83,6 +85,17 @@ class ChannelTracker:
             data[str(bot_id)] = {"username": username, "seen_at": time.time()}
             self._write_bots(data)
 
+    @staticmethod
+    async def _entity_from_invite(client: TelegramClient, invite_hash: str):
+        """Return the chat behind an invite hash if we are a member, else None."""
+        try:
+            info = await client(CheckChatInviteRequest(invite_hash))
+        except RPCError:
+            return None
+        if isinstance(info, (ChatInviteAlready, ChatInvitePeek)):
+            return info.chat
+        return None
+
     async def cleanup_all(self, client: TelegramClient, delay: float = 1.5) -> CleanupResult:
         """Leave all tracked channels, then delete + block all tracked bots.
 
@@ -97,18 +110,23 @@ class ChannelTracker:
 
         # 1. Leave channels
         for index, ch_id in enumerate(channel_ids):
-            if not ch_id.lstrip("-").isdigit():
-                # Old entries saved an invite hash instead of a channel id (join request
-                # pending / never joined). Nothing to leave, just drop them.
-                result.channels_stale += 1
-                async with self.lock:
-                    current = self._read_data()
-                    current.pop(ch_id, None)
-                    self._write_data(current)
-                continue
             try:
-                entity = await client.get_input_entity(PeerChannel(abs(int(ch_id))))
-                await client(LeaveChannelRequest(entity))
+                if ch_id.lstrip("-").isdigit():
+                    entity = await client.get_input_entity(PeerChannel(abs(int(ch_id))))
+                else:
+                    # Invite hash saved from a join-request link: resolve it to the real chat.
+                    entity = await self._entity_from_invite(client, ch_id)
+                    if entity is None:
+                        result.channels_stale += 1
+                        async with self.lock:
+                            current = self._read_data()
+                            current.pop(ch_id, None)
+                            self._write_data(current)
+                        continue
+                if isinstance(entity, Channel):
+                    await client(LeaveChannelRequest(entity))
+                else:
+                    await client.delete_dialog(entity)
                 result.channels_left += 1
                 logging.info("Cleanup: left channel %s", ch_id)
             except FloodWaitError as e:
