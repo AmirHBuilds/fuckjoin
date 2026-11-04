@@ -42,6 +42,9 @@ from .settings import (
     parse_retry_delay,
 )
 from .user_manager import UserManager
+from .sezar_features import react_to_required_channel, click_check_button  # SEZAR-JOIN-PATCH v3
+from .sezar_recovery import deliver_with_retries, mark_explicit_wait, measure_telegram_call
+from .sezar_expiry import SourceMessageMissing, is_verified_expired  # SEZAR-EXPIRY-RETRY v4.1
 
 RESPONSE_TIMEOUT_SECONDS = 30
 MAX_START_ATTEMPTS = 5
@@ -83,6 +86,7 @@ def load_env(path: str = ".env") -> None:
 
 async def interruptible_sleep(duration: float, cancel_event: asyncio.Event) -> None:
     """Sleep for duration, but return immediately if cancel_event is set."""
+    mark_explicit_wait(duration)
     if cancel_event.is_set():
         raise DeliveryCancelledError()
     try:
@@ -121,7 +125,7 @@ async def safe_forward_messages(
             try:
                 res = await client.forward_messages(recipient, chunk)
                 if isinstance(res, list):
-                    sent += len(res)
+                    sent += sum(1 for forwarded in res if forwarded is not None)
                 elif res:
                     sent += len(chunk)
                 if i + chunk_size < len(valid_messages):
@@ -147,6 +151,9 @@ async def safe_forward_messages(
                 logging.warning("Chat has restricted forwarding; skipped chunk.")
                 break
             except RPCError as err:
+                if sent == 0 and await is_verified_expired(client, chunk, err):
+                    raise SourceMessageMissing() from err
+                logging.warning("Forward failure classification: %s", type(err).__name__)
                 logging.warning("RPC error forwarding chunk: %s", err)
                 break
     return sent
@@ -198,12 +205,12 @@ async def join_urls(
 
         await progress.report(f"[➥] Joining {channel_name}")
 
-        for attempt in range(2):
+        for attempt in range(3):
             if cancel_event.is_set():
                 raise DeliveryCancelledError()
             try:
                 if kind == "invite":
-                    updates = await client(ImportChatInviteRequest(value))
+                    updates = await measure_telegram_call(client(ImportChatInviteRequest(value)))
                     chat = updates.chats[0] if getattr(updates, "chats", None) else None
                     chat_id = getattr(chat, "id", None)
                     if chat_id is None:
@@ -213,7 +220,11 @@ async def join_urls(
                     await tracker.record_join(chat_id if chat_id is not None else value)
                 else:
                     channel = await client.get_input_entity(value)
-                    await client(JoinChannelRequest(channel))
+                    # Only channel peers can be joined; links to ordinary bots are not channels.
+                    if not hasattr(channel, "channel_id"):
+                        logging.info("Ignoring non-channel requirement: %s", channel_name)
+                        break
+                    await measure_telegram_call(client(JoinChannelRequest(channel)))
                     await tracker.record_join(getattr(channel, "channel_id", value))
 
                 resolved += 1
@@ -226,7 +237,7 @@ async def join_urls(
                 await progress.report(f"[✓] Already joined {channel_name}", in_place=True)
                 break
             except FloodWaitError as error:
-                if attempt == 1 or error.seconds > 180:
+                if attempt == 2 or error.seconds > 900:
                     failures.append(f"{channel_name} (FloodWaitError: {error.seconds}s)")
                     await progress.report(f"[✗] Could not join {channel_name}", in_place=True)
                     break
@@ -344,12 +355,20 @@ async def run_bot_flow(
         joined_total = 0
         failures: list[str] = []
         seen_links: set[str] = set()
+        known_channel_urls: set[str] = set()
+        reaction_attempted: set[str] = set()
+        clicked_callbacks: set[tuple[int, int, int]] = set()
+        react_count = max(0, min(5, parse_int_setting(os.environ.get("AUTO_REACT_LAST_POSTS"), 0)))
+        reaction_emoji = os.environ.get("AUTO_REACT_EMOJI", "👍").strip() or "👍"
+        reaction_channels = {s.strip().casefold() for s in os.environ.get("AUTO_REACT_CHANNELS", "").split(",") if s.strip()}
 
         for _ in range(MAX_START_ATTEMPTS):
             if cancel_event.is_set():
                 raise DeliveryCancelledError()
 
-            links = response_links(response) - seen_links
+            response_urls = response_links(response)
+            known_channel_urls.update(u for u in response_urls if join_target(u) is not None and not find_start_links({u}))
+            links = response_urls - seen_links
             seen_links.update(links)
             channel_count = sum(
                 1
@@ -365,9 +384,32 @@ async def run_bot_flow(
             )
             joined_total += resolved
             failures.extend(join_failures)
+            # Bounded optional reactions on ONE explicitly required channel.
+            reacted = 0
+            if react_count and known_channel_urls and not join_failures:
+                reacted = await react_to_required_channel(
+                    client, known_channel_urls, getattr(response, "raw_text", "") or "",
+                    count=react_count, emoji=reaction_emoji,
+                    configured_channels=reaction_channels,
+                    attempted=reaction_attempted, progress=progress,
+                    cancel_event=cancel_event, sleep=interruptible_sleep,
+                    pacing_seconds=max(3.0, pacing_delay),
+                )
 
-            if not resolved:
-                break
+            if not resolved and not reacted:
+                pressed = False
+                if not join_failures:
+                    pressed = await click_check_button(response, clicked_callbacks)
+                if not pressed:
+                    break
+                await progress.report("[✓] Pressed verification callback")
+                await interruptible_sleep(1.0, cancel_event)
+                updated = await client.get_messages(bot, ids=response.id)
+                if updated and (updated.raw_text != response.raw_text or updated.media):
+                    response = updated
+                else:
+                    response = await get_actionable_response(conversation, transient_texts, cancel_event)
+                continue
             if retry_delay_seconds:
                 await progress.report(f"[ⴵ] Waiting {retry_delay_seconds:g}s before retry")
                 await interruptible_sleep(retry_delay_seconds, cancel_event)
@@ -440,7 +482,12 @@ async def deliver(
         current = next_start
         seen.add((current.bot, current.argument))
         handoffs += 1
-        await progress.report(f"[→] Following handoff to @{current.bot}")
+        try:
+            await asyncio.wait_for(progress.report(f'[→] Following handoff to @{current.bot}'), timeout=3)
+        except asyncio.TimeoutError:
+            logging.info("Skipping delayed progress edit to prioritize media transfer")
+        except Exception as progress_error:
+            logging.info("Progress edit failed: %s", type(progress_error).__name__)
 
     if cancel_event.is_set():
         raise DeliveryCancelledError()
@@ -448,16 +495,33 @@ async def deliver(
     failure_note = f" Could not join: {'; '.join(failures)}." if failures else ""
 
     deliverable_messages: list[object] = []
-    await progress.report(f"[✶] Fetching {len(responses)} final message(s)")
+    try:
+        await asyncio.wait_for(progress.report(f'[✶] Fetching {len(responses)} final message(s)'), timeout=3)
+    except asyncio.TimeoutError:
+        logging.info("Skipping delayed progress edit to prioritize media transfer")
+    except Exception as progress_error:
+        logging.info("Progress edit failed: %s", type(progress_error).__name__)
     for response in responses:
         if getattr(response, "noforwards", False):
-            await progress.report("[✗] Skipped protected message")
+            try:
+                await asyncio.wait_for(progress.report('[✗] Skipped protected message'), timeout=3)
+            except asyncio.TimeoutError:
+                logging.info("Skipping delayed progress edit to prioritize media transfer")
+            except Exception as progress_error:
+                logging.info("Progress edit failed: %s", type(progress_error).__name__)
             continue
         if is_message_blocked(response, blocked_words):
-            await progress.report("[✗] Skipped filtered promotional message")
+            try:
+                await asyncio.wait_for(progress.report('[✗] Skipped filtered promotional message'), timeout=3)
+            except asyncio.TimeoutError:
+                logging.info("Skipping delayed progress edit to prioritize media transfer")
+            except Exception as progress_error:
+                logging.info("Progress edit failed: %s", type(progress_error).__name__)
             continue
         deliverable_messages.append(response)
 
+    # Never report a text-only subscription notice as successful media delivery.
+    deliverable_messages = [msg for msg in deliverable_messages if getattr(msg, "file", None) is not None]
     if not deliverable_messages:
         status = f"[✗] Cannot deliver: No valid content or protection enabled.{failure_note}"
         return status, []
@@ -474,7 +538,12 @@ async def deliver(
         raise DeliveryCancelledError()
 
     if recipient != "me":
-        await progress.report("[➴] Sending content to requester")
+        try:
+            await asyncio.wait_for(progress.report('[➴] Sending content to requester'), timeout=3)
+        except asyncio.TimeoutError:
+            logging.info("Skipping delayed progress edit to prioritize media transfer")
+        except Exception as progress_error:
+            logging.info("Progress edit failed: %s", type(progress_error).__name__)
         sent_count = await safe_forward_messages(
             client=client,
             recipient=recipient,
@@ -554,7 +623,9 @@ async def process_tasks(
                 raise DeliveryCancelledError()
 
             await task.progress.report("[★] Started")
-            status, delivered_messages = await deliver(
+            status, delivered_messages = await deliver_with_retries(
+                deliver,
+                cancel_error=DeliveryCancelledError,
                 client=client,
                 command=task.command,
                 retry_delay_seconds=retry_delay_seconds,
@@ -589,7 +660,10 @@ async def process_tasks(
             await task.progress.report(status, failed=True, sent_count=0)
         finally:
             active_tasks.pop(task.task_id, None)
-            await send_saved_report(client, task, status, delivered_messages)
+            try:
+                await asyncio.wait_for(send_saved_report(client, task, status, delivered_messages), timeout=20)
+            except Exception:
+                logging.exception("Saved report failed; processing next queued task")
             queue.task_done()
 
 
@@ -608,7 +682,7 @@ async def enqueue_link(
         "<pre>[★] Queued</pre>\n\n"
         "💡 <i>Tip: Send <code>/cancel</code> or <code>cancel</code> to stop.</i>"
     )
-    message = await event.reply(initial_body, parse_mode="html", buttons=Button.clear())
+    message = await event.reply(initial_body, parse_mode="html", buttons=None if event.is_group else Button.clear())
 
     progress = ProgressReporter(message=message, task_id=task_id)
     task = DeliveryTask(
@@ -630,6 +704,20 @@ async def enqueue_link(
         )
 
 
+
+
+async def sezar_supervise_worker(**kwargs):
+    """Restart a failed queue worker without allowing simultaneous consumers."""
+    while True:
+        try:
+            await process_tasks(**kwargs)
+            logging.error("Queue worker exited unexpectedly; restarting")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Queue worker crashed; restarting in 2s")
+        await asyncio.sleep(2)
+
 async def main() -> None:
     logging.getLogger("telethon").setLevel(logging.INFO)
     load_env()
@@ -641,6 +729,11 @@ async def main() -> None:
 
     # ADMINS: Has full control and can use /admin, /add_user, /state, etc.
     admins = parse_requester_ids(os.environ.get("ADMINS"))
+    env_requesters = parse_requester_ids(os.environ.get("ALLOWED_REQUESTER_IDS"))
+    allowed_group_ids = parse_requester_ids(os.environ.get("ALLOWED_GROUP_IDS"))
+    group_allow_all = os.environ.get("GROUP_ALLOW_ALL_MEMBERS", "0").lower() in {"1", "yes", "true"}
+    group_cooldown = max(0, parse_int_setting(os.environ.get("GROUP_USER_COOLDOWN_SECONDS"), 30))
+    group_last_requests: dict[tuple[int, int], float] = {}
 
     default_transients = ["...", "please wait", "processing...", "⏳", "⌛"]
     transient_texts = parse_csv_list(os.environ.get("TRANSIENT_TEXTS"), default=default_transients)
@@ -650,38 +743,67 @@ async def main() -> None:
         os.environ.get("SESSION_NAME", "telegram-automation"),
         api_id,
         api_hash,
-        flood_sleep_threshold=0,
+        flood_sleep_threshold=600,
     )
     queue: asyncio.Queue[DeliveryTask] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     tracker = ChannelTracker()
     user_manager = UserManager()
 
-    pending_user_choices: dict[int, dict[str, dict]] = {}
+    pending_user_choices: dict[tuple[int, int], dict[str, dict]] = {}
     active_tasks: dict[str, DeliveryTask] = {}
 
     @client.on(events.NewMessage)
     async def handle_message(event: events.NewMessage.Event) -> None:
         me = await client.get_me()
+        # Ignore outgoing group/private/channel posts; only Saved Messages is a command inbox. # SEZAR-RELIABILITY v4.2
+        if (event.out and event.chat_id != me.id) or (event.is_group and event.sender_id == me.id):
+            return
+        if os.environ.get("AUTH_DEBUG", "0").strip() == "1" and (event.is_private or event.is_group):
+            logging.info("AUTH_DEBUG sender=%s chat=%s out=%s private=%s group=%s session=%s",
+                         event.sender_id, event.chat_id, event.out, event.is_private, event.is_group, me.id)
 
-        is_self = event.out and event.chat_id == me.id
+        is_self = bool(event.out and event.chat_id == me.id)
         sender_id = me.id if is_self else event.sender_id
-
-        # Determine authorization
-        allowed_users = await user_manager.get_allowed_users()
-        is_admin = is_self or (sender_id in admins)
-        is_allowed_user = sender_id in allowed_users
-
-        # Reject unauthorized requests in private messages
-        if not is_self:
-            if not event.is_private or not (is_admin or is_allowed_user):
-                return
-
-        recipient: str | int = "me" if is_self else sender_id
+        if sender_id is None:
+            return
         text = (event.raw_text or "").strip()
         lower_text = text.lower()
-
+        if is_self and (text.startswith("[Task Report]") or text.startswith("[⏳ Delivery")):
+            return
+        if event.out and not is_self and not event.is_group:
+            return
+        allowed_users = await user_manager.get_allowed_users()
+        is_admin = is_self or sender_id == me.id or sender_id in admins
+        is_allowed_user = sender_id in allowed_users or sender_id in env_requesters
+        if event.is_group:
+            sender = await event.get_sender()
+            if getattr(sender, "bot", False):
+                return
+            if lower_text == "/chatid" and is_admin:
+                await event.reply(f"Telegram group ID: `{event.chat_id}`")
+                return
+            if event.chat_id not in allowed_group_ids:
+                return
+            if not (group_allow_all or is_admin or is_allowed_user):
+                return
+        elif event.is_private:
+            if not (is_self or is_admin or is_allowed_user):
+                return
+        else:
+            return
+        recipient: str | int = "me" if is_self else (event.chat_id if event.is_group else sender_id)
+        choice_key = (event.chat_id, sender_id)
+        if lower_text in {"/ping", "ping", "/whoami"}:
+            await event.reply(
+                f"Connected session: {me.id}\n"
+                f"Message sender: {sender_id}\n"
+                f"Chat: {event.chat_id}\n"
+                f"Outgoing: {bool(event.out)}\n"
+                f"Authorized: {bool(is_admin or is_allowed_user)}"
+            )
+            return
         # --- ADMIN-ONLY COMMANDS ---
-        if is_admin:
+        if is_admin and not event.is_group:
             # /admin or admin command list
             if lower_text in {"/admin", "admin"}:
                 admin_help = (
@@ -808,21 +930,21 @@ async def main() -> None:
         if lower_text in {"/cancel", "cancel"}:
             cancelled_any = False
             for task in list(active_tasks.values()):
-                if task.sender_id == sender_id or (is_self and recipient == "me"):
+                if (task.sender_id == sender_id and task.recipient == recipient) or (is_self and task.recipient == "me"):
                     task.cancel_event.set()
                     cancelled_any = True
 
-            pending_user_choices.pop(sender_id, None)
+            pending_user_choices.pop(choice_key, None)
 
             if cancelled_any:
-                await event.reply("[⊘] Cancellation signal sent. Halting operation...", buttons=Button.clear())
+                await event.reply("[⊘] Cancellation signal sent. Halting operation...", buttons=None if event.is_group else Button.clear())
             else:
-                await event.reply("No active tasks found to cancel.", buttons=Button.clear())
+                await event.reply("No active tasks found to cancel.", buttons=None if event.is_group else Button.clear())
             return
 
         # Handle multiple choice answers
-        if sender_id in pending_user_choices:
-            user_choices = pending_user_choices[sender_id]
+        if choice_key in pending_user_choices:
+            user_choices = pending_user_choices[choice_key]
             matched_key = None
 
             if text in user_choices:
@@ -835,7 +957,7 @@ async def main() -> None:
 
             if matched_key:
                 chosen = user_choices[matched_key]
-                del pending_user_choices[sender_id]
+                del pending_user_choices[choice_key]
                 await enqueue_link(
                     queue=queue,
                     event=event,
@@ -849,6 +971,11 @@ async def main() -> None:
         bot_links = extract_bot_start_links_with_labels(event.message)
         if not bot_links:
             return
+        if event.is_group and group_cooldown:
+            now = asyncio.get_running_loop().time()
+            if now - group_last_requests.get(choice_key, -1e12) < group_cooldown:
+                return
+            group_last_requests[choice_key] = now
 
         if tracker.cleanup_lock.locked():
             await event.reply("🧹 Cleanup is running. Send the link again in a minute.")
@@ -882,18 +1009,18 @@ async def main() -> None:
             keyboard_buttons.append([Button.text(button_text, resize=True, single_use=True)])
             prompt_lines.append(f"<b>{index}.</b> {escape(label)}")
 
-        pending_user_choices[sender_id] = user_choices_map
+        pending_user_choices[choice_key] = user_choices_map
         prompt_lines.append("\n<i>Send <code>/cancel</code> to abort.</i>")
 
         await event.reply(
             "\n".join(prompt_lines),
             parse_mode="html",
-            buttons=keyboard_buttons,
+            buttons=None if event.is_group else keyboard_buttons,
         )
 
     await client.start()
     worker = asyncio.create_task(
-        process_tasks(
+        sezar_supervise_worker(
             queue=queue,
             client=client,
             retry_delay_seconds=retry_delay_seconds,

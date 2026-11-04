@@ -64,7 +64,7 @@ class ProgressReporter:
 
         for _ in range(3):
             try:
-                await self.message.edit(text, parse_mode="html")
+                await asyncio.wait_for(self.message.edit(text, parse_mode="html"), timeout=5)  # SEZAR-PROGRESS-TIMEOUT v4.2
                 break
             except MessageNotModifiedError:
                 break

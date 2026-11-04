@@ -7,6 +7,18 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, unquote, urlparse
 from telethon.tl.types import MessageEntityTextUrl
 
+
+# SEZAR-TELEGRAM-ALIAS v4.3
+# Normalize only actual Telegram domains, not lookalike hostnames.
+_SEZAR_TG_HOST_RE = re.compile(
+    r"(?<![A-Za-z0-9_@./-])(?:https?://)?(?:www\.)?(?:telegram\.me|t\.me)(?=/)",
+    re.IGNORECASE,
+)
+
+def _sezar_normalize_telegram_links(text: str) -> str:
+    """Convert Telegram URL aliases to canonical HTTPS t.me URLs in any text."""
+    return _SEZAR_TG_HOST_RE.sub("https://t.me", text)
+
 START_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]{5,})\?([^\s]+)", re.IGNORECASE)
 TME_LINK_RE = re.compile(r"https?://t\.me/(?:joinchat/)?[^\s<>()]+", re.IGNORECASE)
 
@@ -21,6 +33,7 @@ class StartLink:
 
 def parse_start_link(value: str) -> StartLink:
     """Extract a bot username and non-empty `start` argument from a t.me URL."""
+    value = _sezar_normalize_telegram_links(value)
     match = START_LINK_RE.search(value)
     if not match:
         raise ValueError("Use a link like https://t.me/bot_name?start=argument")
@@ -59,7 +72,7 @@ def extract_bot_start_links_with_labels(message: object) -> list[StartLink]:
                 pass
 
     # 2. Scan plain text URLs
-    for match in START_LINK_RE.finditer(raw_text):
+    for match in START_LINK_RE.finditer(_sezar_normalize_telegram_links(raw_text)):
         url = match.group(0)
         if url not in seen_urls:
             seen_urls.add(url)
@@ -92,11 +105,13 @@ def find_start_links(urls: set[str]) -> list[StartLink]:
 
 def extract_tme_links(text: str) -> set[str]:
     """Return normalized Telegram URLs found in a text response."""
+    text = _sezar_normalize_telegram_links(text)
     return {unquote(match.group(0).rstrip(".,!?")) for match in TME_LINK_RE.finditer(text)}
 
 
 def join_target(url: str) -> tuple[str, str] | None:
     """Classify a public channel username or a private invite hash from a t.me URL."""
+    url = _sezar_normalize_telegram_links(url)
     parsed = urlparse(url)
     if parsed.netloc.lower() not in {"t.me", "www.t.me"}:
         return None

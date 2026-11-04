@@ -1,0 +1,153 @@
+"""Opt-in, bounded Telegram channel-reaction helper for fuckjoin.
+
+Never reacts unless AUTO_REACT_LAST_POSTS is enabled and a bot explicitly asks
+for reactions, or the target channel is explicitly configured. Uses only the
+signed-in account and respects FloodWait. No background bulk-engagement jobs.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Awaitable, Callable, Iterable
+
+from telethon.errors import RPCError
+from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.tl.functions.messages import CheckChatInviteRequest, SendReactionRequest
+from telethon.tl.types import ChatInviteAlready, ChatInvitePeek, ReactionEmoji
+
+from .links import join_target
+
+REACTION_WORDS = re.compile(
+    r"(?i)(?:\blikes?\b|\breact(?:ion|ions)?\b|\bthumbs?\s*up\b|"
+    r"لایک|ری\s*اکشن|واکنش|پسندیدن|بپسندید|پسند\s*کردن)"
+)
+
+
+def reaction_prompt(text: str) -> bool:
+    return bool(REACTION_WORDS.search(text or ""))
+
+
+def _match_target(target: tuple[str, str], configured: set[str]) -> bool:
+    if not configured:
+        return True
+    kind, value = target
+    options = {value.casefold(), f"@{value}".casefold()}
+    if kind == "invite":
+        options.update({f"+{value}".casefold(), f"https://t.me/+{value}".casefold()})
+    else:
+        options.add(f"https://t.me/{value}".casefold())
+    return bool(options & configured)
+
+
+async def _entity_from_link(client: object, target: tuple[str, str]) -> object | None:
+    kind, value = target
+    if kind == "invite":
+        invite = await client(CheckChatInviteRequest(value))
+        if isinstance(invite, (ChatInviteAlready, ChatInvitePeek)):
+            return invite.chat
+        return None  # Not yet accepted into private channel
+    return await client.get_entity(value)
+
+
+async def react_to_required_channel(
+    client: object,
+    channel_urls: Iterable[str],
+    instructions: str,
+    *,
+    count: int,
+    emoji: str,
+    configured_channels: set[str],
+    attempted: set[str],
+    progress: object,
+    cancel_event: object,
+    sleep: Callable[[float, object], Awaitable[None]],
+    pacing_seconds: float = 3.0,
+) -> int:
+    """React to at most five recent posts of at most ONE required channel per flow.
+
+    Explicitly named channels take precedence; otherwise a bot's message must
+    contain instructions about likes/reactions. Each channel is attempted once,
+    and a single flow never moves on to a different channel after one is chosen.
+    Returns number of posts successfully reacted to.
+    """
+    count = max(0, min(5, count))
+    if not count or (not configured_channels and not reaction_prompt(instructions)):
+        return 0
+    if attempted:
+        return 0
+
+    candidates: list[tuple[str, tuple[str, str]]] = []
+    for url in sorted(set(channel_urls)):
+        target = join_target(url)
+        if target is not None and _match_target(target, configured_channels):
+            candidates.append((url, target))
+    if not candidates:
+        return 0
+
+    url, target = candidates[0]
+    await progress.report(f"[👍] Checking up to {count} recent posts in {url}")
+    reacted = 0
+    try:
+        peer = await _entity_from_link(client, target)
+        if peer is None:
+            await progress.report("[!] Reaction channel is not yet accessible")
+            return 0
+        attempted.add(url)
+        # Get up to 30 messages to allow for service messages and pinned notices.
+        async for msg in client.iter_messages(peer, limit=30):
+            if cancel_event.is_set():
+                return reacted
+            if reacted >= count:
+                break
+            if getattr(msg, 'action', None) or not getattr(msg, 'id', None):
+                continue
+            # Only use standard/free emoji, not paid reactions.
+            try:
+                await client(SendReactionRequest(
+                    peer=peer,
+                    msg_id=msg.id,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                ))
+            except FloodWaitError as err:
+                await progress.report(f"[⏳] Telegram reaction cooldown: {err.seconds}s")
+                await sleep(err.seconds + 1, cancel_event)
+                await client(SendReactionRequest(
+                    peer=peer,
+                    msg_id=msg.id,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                ))
+            except RPCError as err:
+                logging.warning("Cannot react to post %s: %s", msg.id, type(err).__name__)
+                continue
+            reacted += 1
+            if reacted < count:
+                await sleep(max(2.0, pacing_seconds), cancel_event)
+    except RPCError as err:
+        logging.warning("Could not access reaction channel: %s", type(err).__name__)
+    await progress.report(f"[👍] Added reactions to {reacted}/{count} posts in {url}")
+    return reacted
+
+VERIFY_WORDS = re.compile(
+    r"(?i)(?:\bcheck\b|\bverify\b|\bconfirm\b|\bdone\b|\bcontinue\b|"
+    r"بررسی|تأیید|تایید|چک\s*کردن|عضویت\s*کردم|✅)"
+)
+
+
+async def click_check_button(response: object, clicked: set[tuple[int, int, int]]) -> bool:
+    """Click at most three explicit callback verification buttons in a flow.
+
+    Never follows external URL buttons and never clicks payment/ad buttons.
+    """
+    if len(clicked) >= 3:
+        return False
+    for row_index, row in enumerate(getattr(response, 'buttons', None) or []):
+        for column_index, button in enumerate(row):
+            key = (getattr(response, 'id', 0), row_index, column_index)
+            if key in clicked or getattr(button, 'data', None) is None:
+                continue
+            if not VERIFY_WORDS.search(getattr(button, 'text', '') or ''):
+                continue
+            clicked.add(key)
+            await response.click(row_index, column_index)
+            return True
+    return False
